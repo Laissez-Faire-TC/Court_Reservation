@@ -237,6 +237,8 @@ class WorkerThread(QThread):
             df1 = df_all.iloc[:user_count]
             df2 = df_all.iloc[user_count:]
             
+            os.makedirs(os.path.dirname(out1), exist_ok=True) if os.path.dirname(out1) else None
+            os.makedirs(os.path.dirname(out2), exist_ok=True) if os.path.dirname(out2) else None
             df1.to_csv(out1, index=False)
             df2.to_csv(out2, index=False)
             
@@ -270,7 +272,7 @@ class WorkerThread(QThread):
     def run_lottery_application(self):
         csv_file = self.params.get("csv_file", "Johoku1.csv")
         park_name = self.params.get("park_name", "城北中央公園")
-        gui_time_code = self.params.get("time_code", None)  # GUIから指定された時間帯
+        gui_time_code = None  # 時間帯はCSVから取得
         apply_number_text = self.params.get("apply_number_text", "申込み1件目")
         headless = self.params.get("headless", True)  # ヘッドレスモード設定
         
@@ -2083,6 +2085,8 @@ class JohokuApp(QMainWindow):
         out_layout = QGridLayout()
         out_layout.addWidget(QLabel("出力ファイル1:"), 0, 0)
         desktop = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+        if not desktop or not os.path.exists(desktop):
+            desktop = os.path.expanduser("~")
         self.output_file1 = QLineEdit(os.path.join(desktop, "Johoku10.csv"))
         out_layout.addWidget(self.output_file1, 0, 1)
         out_layout.addWidget(QLabel("出力ファイル2:"), 1, 0)
@@ -2150,23 +2154,6 @@ class JohokuApp(QMainWindow):
         park_layout.addWidget(self.park_select)
         park_layout.addStretch()
         layout.addLayout(park_layout)
-        
-        # 時間帯選択
-        time_layout = QHBoxLayout()
-        time_layout.addWidget(QLabel("時間帯:"))
-        self.lottery_time_select = QComboBox()
-        # デフォルトは通常の6コマ
-        self.lottery_time_select.addItems([
-            "9:00~11:00",
-            "11:00~13:00", 
-            "13:00~15:00",
-            "15:00~17:00",
-            "17:00~19:00",
-            "19:00~21:00"
-        ])
-        time_layout.addWidget(self.lottery_time_select)
-        time_layout.addStretch()
-        layout.addLayout(time_layout)
         
         # 申込み種類選択
         type_layout = QHBoxLayout()
@@ -2600,51 +2587,45 @@ class JohokuApp(QMainWindow):
         csv_file = self.lottery_csv_file.text()
         apply_number_text = self.apply_type.currentText()
         park_name = self.park_select.currentText()
-        selected_time = self.lottery_time_select.currentText()
-        headless = self.lottery_headless_checkbox.isChecked()  # ヘッドレスモード設定を取得
-        
-        # 時間帯からtime_codeを取得
-        time_code_map = {
-            "9:00~11:00": "1",
-            "11:00~13:00": "2", 
-            "13:00~15:00": "3",
-            "15:00~17:00": "4",
-            "17:00~19:00": "5",
-            "19:00~21:00": "6",
-            "13:00~16:00": "3"  # 冬季の3コマ目
-        }
-        time_code = time_code_map.get(selected_time, "1")
-        
+        headless = self.lottery_headless_checkbox.isChecked()
+
         # 入力チェック
         if not csv_file:
             print("警告: CSVファイルを指定してください。")
             return
-        
+
         # ファイルの存在確認
         if not os.path.exists(csv_file):
             print(f"警告: ファイル {csv_file} が見つかりません。")
             return
-        
+
+        # time_code列の存在確認
+        try:
+            df_check = pd.read_csv(csv_file, nrows=1)
+            if 'time_code' not in df_check.columns:
+                print("エラー: CSVファイルにtime_code列がありません。CSV生成を先に実行してください。")
+                return
+        except Exception as e:
+            print(f"エラー: CSVファイルの読み込みに失敗しました: {e}")
+            return
+
         # ログをクリア
         self.lottery_log.clear()
-        
+
         # 確認情報を表示
         message = (f"CSVファイル: {csv_file}\n"
                   f"公園選択: {park_name}\n"
-                  f"時間帯: {selected_time} (コード: {time_code})\n"
                   f"申込み種類: {apply_number_text}\n"
                   f"ヘッドレスモード: {'有効' if headless else '無効'}\n\n"
                   f"処理を開始します")
         print(message)
-        
+
         # 処理を開始
-        # パラメータを設定
         params = {
             "csv_file": csv_file,
             "park_name": park_name,
-            "time_code": time_code,
             "apply_number_text": apply_number_text,
-            "headless": headless  # ヘッドレスモード設定を追加
+            "headless": headless
         }
         
         # ワーカースレッドを作成・起動
