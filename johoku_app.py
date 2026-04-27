@@ -904,155 +904,170 @@ class WorkerThread(QThread):
                 
                 login_successful = False
                 modal_successful = False
-                
-                try:
+
+                login_retry = 0
+                while login_retry < 3:
+                  try:
                     # サイトにアクセス
                     driver.get(URL)
-                    
+
                     # 「ログイン」ボタンの表示まで待機
                     wait = WebDriverWait(driver, 10)
                     login_button = wait.until(EC.element_to_be_clickable((By.ID, "btn-login")))
                     login_button.click()
-                    
+
                     # ログインフォームの表示を待機
                     user_number_field = wait.until(EC.presence_of_element_located((By.NAME, "userId")))
                     password_field = driver.find_element(By.NAME, "password")
-                    
+
                     # 利用者番号とパスワードを入力
                     user_number_field.send_keys(user_number)
                     password_field.send_keys(password)
                     password_field.send_keys(Keys.RETURN)  # エンターキーで送信
-                    
+
+                    # アラートによる無効ID検出
+                    try:
+                        WebDriverWait(driver, 3).until(EC.alert_is_present())
+                        alert = driver.switch_to.alert
+                        alert_text = alert.text
+                        if "入力された利用者番号は無効です" in alert_text:
+                            self.update_signal.emit(f"ログイン失敗（無効なID）: {user_number}")
+                            alert.accept()
+                            failed_logins.append((user_number, password, user_name))
+                            login_retry = 3  # リトライしない
+                            break
+                        alert.accept()
+                    except:
+                        pass
+
                     # ログイン後にユーザーメニューが表示されるまで待機
-                    try:
-                        WebDriverWait(driver, 10).until(
-                            EC.presence_of_element_located((By.XPATH, "//a[@id='userName']"))
-                        )
-                        self.update_signal.emit(f"ログイン成功: {user_number}")
-                        login_successful = True
-                        
-                        # ペナルティー期間中かチェック
-                        if check_penalty_period(driver):
-                            self.update_signal.emit(f"ユーザー {user_number}: ペナルティー期間中です。処理をスキップします。")
-                            driver.close()
-                            driver.switch_to.window(driver.window_handles[0])
-                            continue
-                    except Exception as e:
-                        self.update_signal.emit(f"ユーザーメニューの表示に失敗: {user_number} - エラー詳細: {e}")
+                    WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.XPATH, "//a[@id='userName']"))
+                    )
+                    self.update_signal.emit(f"ログイン成功: {user_number}")
+                    login_successful = True
+
+                    # ペナルティー期間中かチェック
+                    if check_penalty_period(driver):
+                        self.update_signal.emit(f"ユーザー {user_number}: ペナルティー期間中です。処理をスキップします。")
+                        driver.close()
+                        driver.switch_to.window(driver.window_handles[0])
+                        login_retry = 3  # リトライしない
+                    break  # ログイン成功
+
+                  except Exception as e:
+                    login_retry += 1
+                    self.update_signal.emit(f"ログイン失敗（試行 {login_retry}/3）: {user_number} - {e}")
+                    if login_retry >= 3:
                         failed_logins.append((user_number, password, user_name))
-                        continue
-                    
-                    # モーダルを表示して「抽選申込みの確認」リンクをクリック
+
+                if not login_successful:
+                    continue
+
+                # モーダルを表示して「抽選申込みの確認」リンクをクリック
+                try:
+                    # 「抽選」メニューをクリックしてモーダルを表示
+                    lottery_menu = WebDriverWait(driver, 10).until(
+                        EC.element_to_be_clickable((By.XPATH, "//a[@data-target='#modal-menus']"))
+                    )
+                    lottery_menu.click()
+
+                    # モーダル内の「抽選申込みの確認」リンクをクリック
+                    confirm_button = WebDriverWait(driver, 10).until(
+                        EC.element_to_be_clickable((By.XPATH, "//a[text()='抽選申込みの確認']"))
+                    )
+                    confirm_button.click()
+                    self.update_signal.emit(f"抽選申込みの確認ボタンをクリック: {user_number}")
+                    modal_successful = True
+
+                    # 利用日と時刻の情報を取得
                     try:
-                        # 「抽選」メニューをクリックしてモーダルを表示
-                        lottery_menu = WebDriverWait(driver, 10).until(
-                            EC.element_to_be_clickable((By.XPATH, "//a[@data-target='#modal-menus']"))
-                        )
-                        lottery_menu.click()
-                        
-                        # モーダル内の「抽選申込みの確認」リンクをクリック
-                        confirm_button = WebDriverWait(driver, 10).until(
-                            EC.element_to_be_clickable((By.XPATH, "//a[text()='抽選申込みの確認']"))
-                        )
-                        confirm_button.click()
-                        self.update_signal.emit(f"抽選申込みの確認ボタンをクリック: {user_number}")
-                        modal_successful = True
-                        
-                        # 利用日と時刻の情報を取得
-                        try:
-                            # 少し待機してページが完全に読み込まれるのを待つ
-                            time_module.sleep(2.0)
-                            
-                            # デバッグ: ページの内容をログに出力
-                            page_source = driver.page_source
-                            self.update_signal.emit(f"ユーザー {user_number}: ページタイトル: {driver.title}")
-                            
-                            # 複数のテーブルパターンを試す
-                            table_selectors = [
-                                "//table[@class='table sp-block-table']//tbody",
-                                "//table[@class='table']//tbody", 
-                                "//table//tbody",
-                                "//tbody"
-                            ]
-                            
-                            table_exists = False
-                            rows = []
-                            for selector in table_selectors:
-                                try:
-                                    table_elements = driver.find_elements(By.XPATH, selector)
-                                    if table_elements:
-                                        rows = driver.find_elements(By.XPATH, selector + "//tr")
-                                        if rows:
-                                            table_exists = True
-                                            self.update_signal.emit(f"ユーザー {user_number}: テーブル発見 (セレクター: {selector})")
-                                            break
-                                except:
-                                    continue
-                            
-                            row_count = len(rows)
-                            self.update_signal.emit(f"ユーザー {user_number}: テーブル行数: {row_count}")
-                            
-                            # ファイルに書き込み
-                            with open(output_file, "a", encoding="utf-8") as file:
-                                file.write(f"利用者番号: {user_number}\n")
-                                file.write(f"パスワード: {password}\n")
-                                file.write(f"利用者氏名: {user_name}\n")
-                                
-                                if row_count == 0:
-                                    file.write("申込情報なし\n")
-                                    no_bookings.append((user_number, password, user_name))
-                                    user_booking_count[(user_number, password, user_name)] = 0
-                                else:
-                                    booking_count = 0
-                                    for row in rows:
-                                        status = row.find_element(By.XPATH, "./td[2]").text.strip()
-                                        category = row.find_element(By.XPATH, "./td[3]").text.strip()
-                                        facility = row.find_element(By.XPATH, "./td[4]").text.strip()
-                                        date = row.find_element(By.XPATH, "./td[5]").text.strip()
-                                        time = row.find_element(By.XPATH, "./td[6]").text.strip()
-                                        file.write(f"状況: {status}\n")
-                                        file.write(f"分類: {category}\n")
-                                        file.write(f"公園・施設: {facility}\n")
-                                        file.write(f"利用日: {date}\n")
-                                        file.write(f"時刻: {time}\n")
-                                        
-                                        # 日付と時刻をリストに追加
-                                        reservation_list.append((date, time))
-                                        booking_count += 1
-                                    
-                                    # ユーザーの予約数を記録
-                                    user_booking_count[(user_number, password, user_name)] = booking_count
-                                    
-                                    # 申込みが1つだけの場合
-                                    if booking_count == 1:
-                                        one_booking.append((user_number, password, user_name))
-                                
-                                file.write("---------------\n")
-                        except Exception as e:
-                            self.update_signal.emit(f"予約情報の取得に失敗しました: {user_number} - エラー詳細: {e}")
-                            # モーダル表示には成功しているので、予約情報なしと判断
-                            with open(output_file, "a", encoding="utf-8") as file:
-                                file.write(f"利用者番号: {user_number}\n")
-                                file.write(f"パスワード: {password}\n")
-                                file.write(f"利用者氏名: {user_name}\n")
-                                file.write("申込情報なし（表示エラー）\n")
-                                file.write("---------------\n")
-                            no_bookings.append((user_number, password, user_name))
-                            user_booking_count[(user_number, password, user_name)] = 0
-                            
+                        # 少し待機してページが完全に読み込まれるのを待つ
+                        time_module.sleep(2.0)
+
+                        # デバッグ: ページの内容をログに出力
+                        page_source = driver.page_source
+                        self.update_signal.emit(f"ユーザー {user_number}: ページタイトル: {driver.title}")
+
+                        # 複数のテーブルパターンを試す
+                        table_selectors = [
+                            "//table[@class='table sp-block-table']//tbody",
+                            "//table[@class='table']//tbody",
+                            "//table//tbody",
+                            "//tbody"
+                        ]
+
+                        table_exists = False
+                        rows = []
+                        for selector in table_selectors:
+                            try:
+                                table_elements = driver.find_elements(By.XPATH, selector)
+                                if table_elements:
+                                    rows = driver.find_elements(By.XPATH, selector + "//tr")
+                                    if rows:
+                                        table_exists = True
+                                        self.update_signal.emit(f"ユーザー {user_number}: テーブル発見 (セレクター: {selector})")
+                                        break
+                            except:
+                                continue
+
+                        row_count = len(rows)
+                        self.update_signal.emit(f"ユーザー {user_number}: テーブル行数: {row_count}")
+
+                        # ファイルに書き込み
+                        with open(output_file, "a", encoding="utf-8") as file:
+                            file.write(f"利用者番号: {user_number}\n")
+                            file.write(f"パスワード: {password}\n")
+                            file.write(f"利用者氏名: {user_name}\n")
+
+                            if row_count == 0:
+                                file.write("申込情報なし\n")
+                                no_bookings.append((user_number, password, user_name))
+                                user_booking_count[(user_number, password, user_name)] = 0
+                            else:
+                                booking_count = 0
+                                for row in rows:
+                                    status = row.find_element(By.XPATH, "./td[2]").text.strip()
+                                    category = row.find_element(By.XPATH, "./td[3]").text.strip()
+                                    facility = row.find_element(By.XPATH, "./td[4]").text.strip()
+                                    date = row.find_element(By.XPATH, "./td[5]").text.strip()
+                                    time = row.find_element(By.XPATH, "./td[6]").text.strip()
+                                    file.write(f"状況: {status}\n")
+                                    file.write(f"分類: {category}\n")
+                                    file.write(f"公園・施設: {facility}\n")
+                                    file.write(f"利用日: {date}\n")
+                                    file.write(f"時刻: {time}\n")
+
+                                    # 日付と時刻をリストに追加
+                                    reservation_list.append((date, time))
+                                    booking_count += 1
+
+                                # ユーザーの予約数を記録
+                                user_booking_count[(user_number, password, user_name)] = booking_count
+
+                                # 申込みが1つだけの場合
+                                if booking_count == 1:
+                                    one_booking.append((user_number, password, user_name))
+
+                            file.write("---------------\n")
                     except Exception as e:
-                        self.update_signal.emit(f"抽選申込みの確認ボタンのクリックに失敗しました: {user_number} - エラー詳細: {e}")
-                        failed_logins.append((user_number, password, user_name))
-                    
-                    # 次のログイン試行前に1秒間待機
-                    time_module.sleep(1)
-                        
+                        self.update_signal.emit(f"予約情報の取得に失敗しました: {user_number} - エラー詳細: {e}")
+                        # モーダル表示には成功しているので、予約情報なしと判断
+                        with open(output_file, "a", encoding="utf-8") as file:
+                            file.write(f"利用者番号: {user_number}\n")
+                            file.write(f"パスワード: {password}\n")
+                            file.write(f"利用者氏名: {user_name}\n")
+                            file.write("申込情報なし（表示エラー）\n")
+                            file.write("---------------\n")
+                        no_bookings.append((user_number, password, user_name))
+                        user_booking_count[(user_number, password, user_name)] = 0
+
                 except Exception as e:
-                    self.update_signal.emit(f"処理中にエラーが発生しました: {user_number} - エラー詳細: {e}")
-                    if not login_successful:
-                        failed_logins.append((user_number, password, user_name))
-                    elif not modal_successful:
-                        failed_logins.append((user_number, password, user_name))
+                    self.update_signal.emit(f"抽選申込みの確認ボタンのクリックに失敗しました: {user_number} - エラー詳細: {e}")
+                    failed_logins.append((user_number, password, user_name))
+
+                # 次のログイン試行前に1秒間待機
+                time_module.sleep(1)
             
             # 最終的な進捗状況を100%に設定
             self.progress_signal.emit(100)
@@ -1204,67 +1219,54 @@ class WorkerThread(QThread):
                 # 新しいタブに切り替え
                 driver.switch_to.window(new_tab)
                 
-                try:
+                login_successful = False
+                login_retry = 0
+                while login_retry < 3:
+                  try:
                     # サイトにアクセス
                     driver.get(URL)
-                    
+
                     # 「ログイン」ボタンの表示まで待機
                     wait = WebDriverWait(driver, 10)
                     login_button = wait.until(EC.element_to_be_clickable((By.ID, "btn-login")))
                     login_button.click()
-                    
+
                     # ログインフォームの表示を待機
                     user_number_field = wait.until(EC.presence_of_element_located((By.NAME, "userId")))
                     password_field = driver.find_element(By.NAME, "password")
-                    
+
                     # 利用者番号とパスワードを入力
                     user_number_field.send_keys(user_number)
                     password_field.send_keys(password)
                     password_field.send_keys(Keys.RETURN)  # エンターキーで送信
-                    
-                    # ログイン処理の完了を待つ
-                    time_module.sleep(3)
-                    
-                    # アラートの確認
+
+                    # アラートによる無効ID検出
                     try:
                         WebDriverWait(driver, 3).until(EC.alert_is_present())
                         alert = driver.switch_to.alert
                         alert_text = alert.text
-                        self.update_signal.emit(f"アラート検出: {alert_text}")
-                        
                         if "入力された利用者番号は無効です" in alert_text:
-                            self.update_signal.emit(f"ユーザー {user_number}: 利用者番号が無効です。次のユーザーに進みます。")
+                            self.update_signal.emit(f"ログイン失敗（無効なID）: {user_number}")
                             alert.accept()
                             failed_logins.append((user_number, user_name))
                             with open(output_file, "a", encoding="utf-8") as file:
                                 file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
-                                file.write("  エラー: 利用者番号が無効です\n\n")
+                                file.write("  ログイン失敗（無効なID）\n\n")
                             driver.close()
                             driver.switch_to.window(driver.window_handles[0])
-                            continue
-                        else:
-                            alert.accept()
+                            login_retry = 3  # リトライしない
+                            break
+                        alert.accept()
                     except:
-                        # アラートがない場合は続行
                         pass
-                    
+
                     # ログイン成功の確認
-                    try:
-                        WebDriverWait(driver, 10).until_not(
-                            EC.presence_of_element_located((By.ID, "btn-login"))
-                        )
-                        self.update_signal.emit(f"ログイン成功: {user_number}")
-                    except:
-                        # ログインボタンが残っている場合はログイン失敗
-                        self.update_signal.emit(f"ログイン失敗: {user_number}")
-                        failed_logins.append((user_number, user_name))
-                        with open(output_file, "a", encoding="utf-8") as file:
-                            file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
-                            file.write("  エラー: ログイン失敗\n\n")
-                        driver.close()
-                        driver.switch_to.window(driver.window_handles[0])
-                        continue
-                    
+                    WebDriverWait(driver, 10).until_not(
+                        EC.presence_of_element_located((By.ID, "btn-login"))
+                    )
+                    self.update_signal.emit(f"ログイン成功: {user_number}")
+                    login_successful = True
+
                     # ペナルティー期間中かチェック
                     if check_penalty_period(driver):
                         self.update_signal.emit(f"ユーザー {user_number}: ペナルティー期間中です。処理をスキップします。")
@@ -1273,8 +1275,22 @@ class WorkerThread(QThread):
                             file.write("  ペナルティー期間中\n\n")
                         driver.close()
                         driver.switch_to.window(driver.window_handles[0])
-                        continue
-                    
+                        login_retry = 3  # リトライしない
+                    break  # ログイン成功
+
+                  except Exception as e:
+                    login_retry += 1
+                    self.update_signal.emit(f"ログイン失敗（試行 {login_retry}/3）: {user_number} - {e}")
+                    if login_retry >= 3:
+                        failed_logins.append((user_number, user_name))
+                        with open(output_file, "a", encoding="utf-8") as file:
+                            file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                            file.write("  ログイン失敗（3回試行）\n\n")
+
+                if not login_successful:
+                    continue
+
+                try:
                     # モーダルを表示して「抽選結果」リンクをクリック
                     try:
                         # 「抽選」メニューをクリックしてモーダルを表示
@@ -1292,13 +1308,24 @@ class WorkerThread(QThread):
                         
                         # 当選結果のテーブルが表示されるまで待機
                         try:
+                            # 全落選時のメッセージを先に確認してすぐスキップ
+                            no_result_elements = driver.find_elements(By.XPATH, "//*[contains(text(), '該当する抽選はありません')]")
+                            if no_result_elements:
+                                self.update_signal.emit(f"ユーザー {user_number}: 該当する抽選はありません")
+                                with open(output_file, "a", encoding="utf-8") as file:
+                                    file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                                    file.write("  該当する抽選はありません\n\n")
+                                driver.close()
+                                driver.switch_to.window(driver.window_handles[0])
+                                continue
+
                             WebDriverWait(driver, 3).until(
                                 EC.presence_of_element_located((By.XPATH, "//table[@class='table sp-block-table']/tbody/tr"))
                             )
-                            
+
                             # 当選結果の情報を取得し、選択ボタンをクリック
                             rows = driver.find_elements(By.XPATH, "//table[@class='table sp-block-table']/tbody/tr")
-                            
+
                             if rows:
                                 with open(output_file, "a", encoding="utf-8") as file:
                                     file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
@@ -1498,79 +1525,119 @@ class WorkerThread(QThread):
                 new_tab = driver.window_handles[-1]
                 driver.switch_to.window(new_tab)
                 
-                try:
+                login_successful = False
+                login_retry = 0
+                while login_retry < 3:
+                  try:
                     # サイトにアクセス
                     driver.get(URL)
                     self.update_signal.emit(f"サイトにアクセス: {URL}")
-                    
+
                     # 「ログイン」ボタンの表示まで待機
                     wait = WebDriverWait(driver, 10)
                     login_button = wait.until(EC.element_to_be_clickable((By.ID, "btn-login")))
                     login_button.click()
                     self.update_signal.emit("ログインボタンをクリック")
-                    
+
                     # ログインフォームの表示を待機
                     user_number_field = wait.until(EC.presence_of_element_located((By.NAME, "userId")))
                     password_field = driver.find_element(By.NAME, "password")
-                    
+
                     # 利用者番号とパスワードを入力
                     user_number_field.send_keys(user_number)
                     password_field.send_keys(password)
                     password_field.send_keys(Keys.RETURN)  # エンターキーで送信
                     self.update_signal.emit(f"ログイン情報入力: {user_number}")
-                    
+
+                    # アラートによる無効ID検出
+                    try:
+                        WebDriverWait(driver, 3).until(EC.alert_is_present())
+                        alert = driver.switch_to.alert
+                        alert_text = alert.text
+                        if "入力された利用者番号は無効です" in alert_text:
+                            self.update_signal.emit(f"ログイン失敗（無効なID）: {user_number}")
+                            alert.accept()
+                            failed_logins.append((user_number, password, user_name))
+                            with open(result_file, "a", encoding="utf-8") as file:
+                                file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                                file.write("  ログイン失敗（無効なID）\n")
+                                file.write("---------------\n")
+                            driver.close()
+                            driver.switch_to.window(driver.window_handles[0])
+                            login_retry = 3  # リトライしない
+                            break
+                        alert.accept()
+                    except:
+                        pass
+
                     # ログイン後にユーザーメニューが表示されるまで待機
                     WebDriverWait(driver, 10).until(
                         EC.presence_of_element_located((By.XPATH, "//a[@id='userName']"))
                     )
                     self.update_signal.emit(f"ログイン成功: {user_number}")
-                    
+                    login_successful = True
+
                     # ペナルティー期間中かチェック
                     if check_penalty_period(driver):
                         self.update_signal.emit(f"ユーザー {user_number}: ペナルティー期間中です。処理をスキップします。")
-                        with open(output_file, "a", encoding="utf-8") as file:
+                        with open(result_file, "a", encoding="utf-8") as file:
                             file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
                             file.write("  ペナルティー期間中\n\n")
                         driver.close()
                         driver.switch_to.window(driver.window_handles[0])
-                        continue
-                    
+                        login_retry = 3  # リトライしない
+                    break  # ログイン成功
+
+                  except Exception as e:
+                    login_retry += 1
+                    self.update_signal.emit(f"ログイン失敗（試行 {login_retry}/3）: {user_number} - {e}")
+                    if login_retry >= 3:
+                        failed_logins.append((user_number, password, user_name))
+                        with open(result_file, "a", encoding="utf-8") as file:
+                            file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                            file.write(f"  ログイン失敗（3回試行）\n")
+                            file.write("---------------\n")
+
+                if not login_successful:
+                    continue
+
+                try:
                     # 「予約の確認」メニューを開く
                     lottery_menu = WebDriverWait(driver, 10).until(
                         EC.element_to_be_clickable((By.XPATH, "//a[@data-target='#modal-reservation-menus']"))
                     )
                     lottery_menu.click()
                     self.update_signal.emit("予約メニューをクリック")
-                    
+
                     confirm_button = WebDriverWait(driver, 10).until(
                         EC.element_to_be_clickable((By.XPATH, "//a[text()='予約の確認']"))
                     )
                     confirm_button.click()
                     self.update_signal.emit(f"予約の確認ボタンをクリック: {user_number}")
-                    
+
                     # 一旦待機して画面を読み込む
                     time_module.sleep(2)
-                    
+
                     # ファイルに書き込む準備
                     with open(result_file, "a", encoding="utf-8") as file:
                         file.write(f"利用者番号: {user_number}\n")
                         file.write(f"利用者氏名: {user_name}\n")
-                    
+
                     # テーブルの存在を確認（存在しない場合もエラーにしない）
                     # find_elementsはリストを返すので、長さをチェックする
                     tables = driver.find_elements(By.ID, "rsvacceptlist")
                     has_table = len(tables) > 0
-                    
+
                     if has_table:
                         # テーブルが存在する場合
                         table = tables[0]
                         self.update_signal.emit("予約テーブルを確認")
-                        
+
                         # テーブルの各行を取得
                         rows = table.find_elements(By.XPATH, ".//tr")
                         row_count = len(rows)
                         self.update_signal.emit(f"テーブル行数: {row_count}")
-                        
+
                         if row_count <= 1:  # ヘッダー行のみの場合
                             self.update_signal.emit("テーブルはありますが、予約情報が存在しません。")
                             with open(result_file, "a", encoding="utf-8") as file:
@@ -1585,12 +1652,12 @@ class WorkerThread(QThread):
                                         # 日付と時間を取得
                                         date_text = cols[0].text.strip()  # 利用日を取得
                                         time_str = cols[1].text.strip()  # 時間を取得（変数名を変更）
-                                        
+
                                         # 書き込み
                                         file.write(f"利用日: {date_text}\n")
                                         file.write(f"時刻: {time_str}\n")
                                         file.write("\n")
-                                        
+
                                         reservation_list.append((date_text, time_str, user_name, user_number))
                             self.update_signal.emit(f"予約情報をファイルに書き込み完了: {user_number}")
                     else:
@@ -1598,11 +1665,11 @@ class WorkerThread(QThread):
                         self.update_signal.emit("予約テーブルが存在しません（予約なし）")
                         with open(result_file, "a", encoding="utf-8") as file:
                             file.write("予約情報が存在しません。\n")
-                    
+
                     # 必ず区切り線を書き込む
                     with open(result_file, "a", encoding="utf-8") as file:
                         file.write("---------------\n")
-                    
+
                 except Exception as e:
                     self.update_signal.emit(f"ユーザー {user_number} の処理中にエラーが発生しました - エラー詳細: {e}")
                     failed_logins.append((user_number, password, user_name))
@@ -1751,25 +1818,51 @@ class WorkerThread(QThread):
                 driver.execute_script("window.open('');")
                 driver.switch_to.window(driver.window_handles[-1])
                 
-                try:
+                login_successful = False
+                login_retry = 0
+                while login_retry < 3:
+                  try:
                     # サイトにアクセス
                     driver.get(URL)
-                    
+
                     # ログインボタンクリック
                     login_button = wait.until(EC.element_to_be_clickable((By.ID, "btn-login")))
                     login_button.click()
-                    
+
                     # ログインフォーム入力
                     user_number_field = wait.until(EC.presence_of_element_located((By.NAME, "userId")))
                     password_field = driver.find_element(By.NAME, "password")
-                    
+
                     user_number_field.send_keys(user_number)
                     password_field.send_keys(password)
                     password_field.send_keys(Keys.RETURN)
-                    
+
+                    # アラートによる無効ID検出
+                    try:
+                        WebDriverWait(driver, 3).until(EC.alert_is_present())
+                        alert = driver.switch_to.alert
+                        alert_text = alert.text
+                        if "入力された利用者番号は無効です" in alert_text:
+                            self.update_signal.emit(f"ログイン失敗（無効なID）: {user_number}")
+                            alert.accept()
+                            results.append({
+                                'user_number': user_number,
+                                'user_name': user_name,
+                                'expiry_info': "ログイン失敗（無効なID）",
+                                'expiry_date': datetime(9999, 12, 31)
+                            })
+                            driver.close()
+                            driver.switch_to.window(driver.window_handles[0])
+                            login_retry = 3  # リトライしない
+                            break
+                        alert.accept()
+                    except:
+                        pass
+
                     # ログイン成功確認
                     wait.until_not(EC.presence_of_element_located((By.ID, "btn-login")))
-                    
+                    login_successful = True
+
                     # ペナルティー期間中かチェック
                     if check_penalty_period(driver):
                         self.update_signal.emit(f"ユーザー {user_number}: ペナルティー期間中です。処理をスキップします。")
@@ -1778,33 +1871,49 @@ class WorkerThread(QThread):
                             file.write("  ペナルティー期間中\n\n")
                         driver.close()
                         driver.switch_to.window(driver.window_handles[0])
-                        continue
-                    
+                        login_retry = 3  # リトライしない
+                    break  # ログイン成功
+
+                  except Exception as e:
+                    login_retry += 1
+                    self.update_signal.emit(f"ログイン失敗（試行 {login_retry}/3）: {user_number} - {e}")
+                    if login_retry >= 3:
+                        results.append({
+                            'user_number': user_number,
+                            'user_name': user_name,
+                            'expiry_info': "ログイン失敗（3回試行）",
+                            'expiry_date': datetime(9999, 12, 31)
+                        })
+
+                if not login_successful:
+                    continue
+
+                try:
                     # マイメニューのドロップダウンを表示
                     dropdown_menu = wait.until(EC.element_to_be_clickable((By.ID, "userName")))
                     dropdown_menu.click()
-                    
+
                     # 利用者情報の変更・削除・更新リンクをクリック
                     user_info_link = wait.until(
                         EC.element_to_be_clickable((By.XPATH, "//a[contains(text(), '利用者情報の変更・削除・更新')]"))
                     )
                     user_info_link.click()
-                    
+
                     # ページ遷移の完了を待機
                     time_module.sleep(2)
-                    
+
                     # 有効期限の情報を取得
                     try:
                         # 有効期限を特定のXPathで探す
                         expiry_element = wait.until(
-                            EC.presence_of_element_located((By.XPATH, 
+                            EC.presence_of_element_located((By.XPATH,
                                 "//th[.//label[@for='validEndYMD']]/following-sibling::td"
                             ))
                         )
                         expiry_info = expiry_element.text.strip()
-                        
+
                         self.update_signal.emit(f"有効期限を取得: {user_number} - {expiry_info}")
-                        
+
                         # 日付をdatetimeオブジェクトに変換
                         try:
                             # "2025年2月28日" -> datetime
@@ -1812,7 +1921,7 @@ class WorkerThread(QThread):
                             month = int(expiry_info[5:expiry_info.index("月")])
                             day = int(expiry_info[expiry_info.index("月")+1:expiry_info.index("日")])
                             expiry_date = datetime(year, month, day)
-                            
+
                             # 結果をリストに追加
                             results.append({
                                 'user_number': user_number,
@@ -1829,7 +1938,7 @@ class WorkerThread(QThread):
                                 'expiry_info': expiry_info,
                                 'expiry_date': datetime(9999, 12, 31)  # 遠い未来の日付
                             })
-                        
+
                     except Exception as e:
                         self.update_signal.emit(f"有効期限の取得に失敗: {str(e)}")
                         # 失敗した場合も結果に追加
@@ -1839,7 +1948,7 @@ class WorkerThread(QThread):
                             'expiry_info': "取得失敗",
                             'expiry_date': datetime(9999, 12, 31)  # 遠い未来の日付
                         })
-                
+
                 except Exception as e:
                     self.update_signal.emit(f"ユーザー {user_number} の処理中にエラーが発生: {str(e)}")
                     results.append({
