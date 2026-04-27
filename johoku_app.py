@@ -2082,10 +2082,11 @@ class JohokuApp(QMainWindow):
         # 出力ファイル名
         out_layout = QGridLayout()
         out_layout.addWidget(QLabel("出力ファイル1:"), 0, 0)
-        self.output_file1 = QLineEdit("Johoku10.csv")
+        desktop = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+        self.output_file1 = QLineEdit(os.path.join(desktop, "Johoku10.csv"))
         out_layout.addWidget(self.output_file1, 0, 1)
         out_layout.addWidget(QLabel("出力ファイル2:"), 1, 0)
-        self.output_file2 = QLineEdit("Johoku20.csv")
+        self.output_file2 = QLineEdit(os.path.join(desktop, "Johoku20.csv"))
         out_layout.addWidget(self.output_file2, 1, 1)
         layout.addLayout(out_layout)
         
