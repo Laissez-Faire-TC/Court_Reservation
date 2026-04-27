@@ -23,8 +23,8 @@
 
 1. リポジトリをクローン
 ```bash
-git clone <repository-url>
-cd Laissez-FaireT.C._App
+git clone https://github.com/Laissez-Faire-TC/Court_Reservation.git
+cd Court_Reservation
 ```
 
 2. 依存関係をインストール
