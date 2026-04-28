@@ -1743,7 +1743,7 @@ class WorkerThread(QThread):
                     df = df.dropna(subset=['利用日'])
                     
                     # ソート
-                    df.sort_values(by=['利用日', '時刻'], inplace=True)
+                    df = df.sort_values(by=['利用日', '時刻'])
                     
                     # 集計結果をテキストファイルに書き込み
                     with open(result_file, "a", encoding="utf-8") as file:
