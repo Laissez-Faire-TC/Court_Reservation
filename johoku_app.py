@@ -2533,22 +2533,25 @@ class JohokuApp(QMainWindow):
         
         # 入力チェック
         if not input_file:
-            print("警告: 入力CSVファイルを指定してください。")
+            self.csv_log.clear()
+            self.csv_log.append("警告: 入力CSVファイルを指定してください。")
             return
-        
+
         if not booking_dates_text:
-            print("警告: 予約日を入力してください。")
+            self.csv_log.clear()
+            self.csv_log.append("警告: 予約日を入力してください。")
             return
-        
+
         # 予約日をリストに変換
         booking_dates = [d.strip() for d in booking_dates_text.split(",")]
-        
+
         # 日付形式の検証
         for date in booking_dates:
             try:
                 datetime.strptime(date, "%Y-%m-%d")
             except ValueError:
-                print(f"警告: 無効な日付形式です: {date}。正しい形式は YYYY-MM-DD (例: 2025-07-05) です。")
+                self.csv_log.clear()
+                self.csv_log.append(f"警告: 無効な日付形式です: {date}。正しい形式は YYYY-MM-DD (例: 2025-07-05) です。")
                 return
         
         # ログをクリア
