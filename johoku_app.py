@@ -152,18 +152,32 @@ def get_writable_dir():
     except:
         pass
     
-    # ドキュメントディレクトリが使用できない場合は一時ディレクトリを使用
+    # ホームフォルダを試す（OneDrive環境でも確実に存在する）
+    try:
+        home_dir = os.path.expanduser("~")
+        app_dir = os.path.join(home_dir, "JohokuTennisApp")
+        if not os.path.exists(app_dir):
+            os.makedirs(app_dir)
+        test_file = os.path.join(app_dir, "test_write.tmp")
+        try:
+            with open(test_file, 'w') as f:
+                f.write("test")
+            os.remove(test_file)
+            return app_dir
+        except:
+            pass
+    except:
+        pass
+
+    # 最終手段として一時ディレクトリを使用
     try:
         import tempfile
         temp_dir = tempfile.gettempdir()
         app_dir = os.path.join(temp_dir, "JohokuTennisApp")
-        
         if not os.path.exists(app_dir):
             os.makedirs(app_dir)
-            
         return app_dir
     except:
-        # 最後の手段としてカレントディレクトリを返す
         return os.getcwd()
 
 # バックグラウンド処理用のスレッドクラス
