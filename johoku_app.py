@@ -1565,7 +1565,7 @@ class WorkerThread(QThread):
                     password_field.send_keys(Keys.RETURN)  # エンターキーで送信
                     self.update_signal.emit(f"ログイン情報入力: {user_number}")
 
-                    # アラートによる無効ID検出
+                    # アラートによる無効ID・パスワード誤り検出
                     try:
                         WebDriverWait(driver, 3).until(EC.alert_is_present())
                         alert = driver.switch_to.alert
@@ -1577,6 +1577,18 @@ class WorkerThread(QThread):
                             with open(result_file, "a", encoding="utf-8") as file:
                                 file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
                                 file.write("  ログイン失敗（無効なID）\n")
+                                file.write("---------------\n")
+                            driver.close()
+                            driver.switch_to.window(driver.window_handles[0])
+                            login_retry = 3  # リトライしない
+                            break
+                        elif "パスワードが誤っています" in alert_text or "利用者番号、またはパスワードが誤っています" in alert_text:
+                            self.update_signal.emit(f"ログイン失敗（パスワード誤り）: {user_number}")
+                            alert.accept()
+                            failed_logins.append((user_number, password, user_name))
+                            with open(result_file, "a", encoding="utf-8") as file:
+                                file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                                file.write("  ログイン失敗（パスワード誤り）\n")
                                 file.write("---------------\n")
                             driver.close()
                             driver.switch_to.window(driver.window_handles[0])
