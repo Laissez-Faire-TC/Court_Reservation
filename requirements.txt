@@ -2,4 +2,4 @@ PyQt5==5.15.11
 pandas>=2.2.2
 selenium==4.15.2
 webdriver-manager==4.0.2
-pyinstaller==6.13.0
+pyinstaller>=6.13.0
