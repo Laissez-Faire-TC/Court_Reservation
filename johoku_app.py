@@ -4,6 +4,16 @@
 
 import sys
 import os
+
+# Qt platform plugin のパスを明示的に設定（Python 3.14等で必要な場合がある）
+try:
+    import PyQt5
+    _qt_plugin_path = os.path.join(os.path.dirname(PyQt5.__file__), 'Qt5', 'plugins', 'platforms')
+    if os.path.exists(_qt_plugin_path):
+        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = _qt_plugin_path
+except Exception:
+    pass
+
 import pandas as pd
 import time as time_module
 import random
