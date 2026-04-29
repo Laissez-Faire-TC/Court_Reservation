@@ -869,67 +869,60 @@ class WorkerThread(QThread):
 
     # 抽選申込状況の確認処理
     def check_lottery_status(self):
+        import threading
+        import concurrent.futures
+
         csv_file = self.params.get("csv_file", "Johoku1.csv")
-        headless = self.params.get("headless", True)  # ヘッドレスモード設定
-        
-        # CSVファイルからデータを読み込み
+        headless = self.params.get("headless", True)
+        parallel = self.params.get("parallel", 2)
+
         self.update_signal.emit(f"ファイル {csv_file} からユーザー情報を読み込んでいます...")
         self.update_signal.emit(f"ヘッドレスモード: {'有効' if headless else '無効'}")
-        
-        users_data = pd.read_csv(csv_file, dtype={
-            'user_number': str,
-            'password': str
-        })
-        
+        self.update_signal.emit(f"並列数: {parallel}")
+
+        users_data = pd.read_csv(csv_file, dtype={'user_number': str, 'password': str})
         total_users = len(users_data)
         self.update_signal.emit(f"{total_users}人のユーザー情報を読み込みました。")
-        
-        # 日付と時刻の組み合わせを保存するリスト
+
         reservation_list = []
-        # ログインに失敗したアカウントを保存するリスト
         failed_logins = []
-        # 申込がされていないアカウントを保存するリスト
         no_bookings = []
-        # 申込が1つのみのアカウントを保存するリスト
         one_booking = []
-        # 各ユーザーの予約数を追跡する辞書
         user_booking_count = defaultdict(int)
-        
-        # 書き込み可能なディレクトリを取得
+        data_lock = threading.Lock()
+
         writable_dir = get_writable_dir()
-        # 結果ファイルを初期化
         output_file = os.path.join(writable_dir, "reservation_info.txt")
         self.update_signal.emit(f"出力ファイル: {output_file}")
-        
+        file_lock = threading.Lock()
+
         with open(output_file, "w", encoding="utf-8") as file:
             file.write("=== 抽選申込状況の確認 ===\n")
             file.write(f"実行日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        
-        # Chromeブラウザの起動
-        self.update_signal.emit("Chromeブラウザを起動しています...")
-        options = setup_chrome_options(headless)  # ヘッドレスモード設定を渡す
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-        try:
-            for index, row in users_data.iterrows():
-                if not self.is_running:
-                    self.update_signal.emit("処理が中断されました。")
-                    break
-                    
-                user_number = row['user_number']
-                password = row['password']
-                user_name = row.get('Name', '不明')  # Name列がない場合は'不明'を使用
-                
-                progress = int((index / total_users) * 100)
-                self.progress_signal.emit(progress)
-                
-                self.update_signal.emit(f"\nユーザー {user_number} の処理を開始します... ({index+1}/{total_users})")
-                
-                # 新しいタブを開く
-                driver.execute_script("window.open('');")
-                # 新しいタブのハンドルを取得
-                new_tab = driver.window_handles[-1]
-                # 新しいタブに切り替え
-                driver.switch_to.window(new_tab)
+
+        completed_count = [0]
+        progress_lock = threading.Lock()
+
+        def process_chunk(chunk_df, chunk_id):
+            driver = None
+            try:
+                options = setup_chrome_options(headless)
+                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+
+                for index, row in chunk_df.iterrows():
+                    if not self.is_running:
+                        self.update_signal.emit(f"[スレッド{chunk_id}] 処理が中断されました。")
+                        break
+
+                    user_number = row['user_number']
+                    password = row['password']
+                    user_name = row.get('Name', '不明')
+
+                    self.update_signal.emit(f"\n[スレッド{chunk_id}] ユーザー {user_number} の処理を開始します...")
+
+                    driver.execute_script("window.open('');")
+                    new_tab = driver.window_handles[-1]
+                    driver.switch_to.window(new_tab)
                 
                 login_successful = False
                 modal_successful = False
@@ -962,7 +955,8 @@ class WorkerThread(QThread):
                         if "入力された利用者番号は無効です" in alert_text:
                             self.update_signal.emit(f"ログイン失敗（無効なID）: {user_number}")
                             alert.accept()
-                            failed_logins.append((user_number, password, user_name))
+                            with data_lock:
+                                failed_logins.append((user_number, password, user_name))
                             login_retry = 3  # リトライしない
                             break
                         alert.accept()
@@ -988,9 +982,13 @@ class WorkerThread(QThread):
                     login_retry += 1
                     self.update_signal.emit(f"ログイン失敗（試行 {login_retry}/3）: {user_number} - {e}")
                     if login_retry >= 3:
-                        failed_logins.append((user_number, password, user_name))
+                        with data_lock:
+                            failed_logins.append((user_number, password, user_name))
 
                 if not login_successful:
+                    with progress_lock:
+                        completed_count[0] += 1
+                        self.progress_signal.emit(int((completed_count[0] / total_users) * 100))
                     continue
 
                 # モーダルを表示して「抽選申込みの確認」リンクをクリック
@@ -1043,210 +1041,187 @@ class WorkerThread(QThread):
                         row_count = len(rows)
                         self.update_signal.emit(f"ユーザー {user_number}: テーブル行数: {row_count}")
 
-                        # ファイルに書き込み
-                        with open(output_file, "a", encoding="utf-8") as file:
-                            file.write(f"利用者番号: {user_number}\n")
-                            file.write(f"パスワード: {password}\n")
-                            file.write(f"利用者氏名: {user_name}\n")
+                        # ファイルに書き込み（ロック使用）
+                        booking_count = 0
+                        local_reservations = []
+                        if row_count > 0:
+                            for row in rows:
+                                status = row.find_element(By.XPATH, "./td[2]").text.strip()
+                                category = row.find_element(By.XPATH, "./td[3]").text.strip()
+                                facility = row.find_element(By.XPATH, "./td[4]").text.strip()
+                                date = row.find_element(By.XPATH, "./td[5]").text.strip()
+                                time = row.find_element(By.XPATH, "./td[6]").text.strip()
+                                local_reservations.append((date, time, status, category, facility))
+                                booking_count += 1
 
+                        with file_lock:
+                            with open(output_file, "a", encoding="utf-8") as file:
+                                file.write(f"利用者番号: {user_number}\n")
+                                file.write(f"パスワード: {password}\n")
+                                file.write(f"利用者氏名: {user_name}\n")
+                                if row_count == 0:
+                                    file.write("申込情報なし\n")
+                                else:
+                                    for date, time, status, category, facility in local_reservations:
+                                        file.write(f"状況: {status}\n")
+                                        file.write(f"分類: {category}\n")
+                                        file.write(f"公園・施設: {facility}\n")
+                                        file.write(f"利用日: {date}\n")
+                                        file.write(f"時刻: {time}\n")
+                                file.write("---------------\n")
+
+                        with data_lock:
                             if row_count == 0:
-                                file.write("申込情報なし\n")
                                 no_bookings.append((user_number, password, user_name))
                                 user_booking_count[(user_number, password, user_name)] = 0
                             else:
-                                booking_count = 0
-                                for row in rows:
-                                    status = row.find_element(By.XPATH, "./td[2]").text.strip()
-                                    category = row.find_element(By.XPATH, "./td[3]").text.strip()
-                                    facility = row.find_element(By.XPATH, "./td[4]").text.strip()
-                                    date = row.find_element(By.XPATH, "./td[5]").text.strip()
-                                    time = row.find_element(By.XPATH, "./td[6]").text.strip()
-                                    file.write(f"状況: {status}\n")
-                                    file.write(f"分類: {category}\n")
-                                    file.write(f"公園・施設: {facility}\n")
-                                    file.write(f"利用日: {date}\n")
-                                    file.write(f"時刻: {time}\n")
-
-                                    # 日付と時刻をリストに追加
+                                for date, time, _, _, _ in local_reservations:
                                     reservation_list.append((date, time))
-                                    booking_count += 1
-
-                                # ユーザーの予約数を記録
                                 user_booking_count[(user_number, password, user_name)] = booking_count
-
-                                # 申込みが1つだけの場合
                                 if booking_count == 1:
                                     one_booking.append((user_number, password, user_name))
 
-                            file.write("---------------\n")
                     except Exception as e:
                         self.update_signal.emit(f"予約情報の取得に失敗しました: {user_number} - エラー詳細: {e}")
-                        # モーダル表示には成功しているので、予約情報なしと判断
-                        with open(output_file, "a", encoding="utf-8") as file:
-                            file.write(f"利用者番号: {user_number}\n")
-                            file.write(f"パスワード: {password}\n")
-                            file.write(f"利用者氏名: {user_name}\n")
-                            file.write("申込情報なし（表示エラー）\n")
-                            file.write("---------------\n")
-                        no_bookings.append((user_number, password, user_name))
-                        user_booking_count[(user_number, password, user_name)] = 0
+                        with file_lock:
+                            with open(output_file, "a", encoding="utf-8") as file:
+                                file.write(f"利用者番号: {user_number}\n")
+                                file.write(f"パスワード: {password}\n")
+                                file.write(f"利用者氏名: {user_name}\n")
+                                file.write("申込情報なし（表示エラー）\n")
+                                file.write("---------------\n")
+                        with data_lock:
+                            no_bookings.append((user_number, password, user_name))
+                            user_booking_count[(user_number, password, user_name)] = 0
 
                 except Exception as e:
-                    self.update_signal.emit(f"抽選申込みの確認ボタンのクリックに失敗しました: {user_number} - エラー詳細: {e}")
-                    failed_logins.append((user_number, password, user_name))
+                    self.update_signal.emit(f"[スレッド{chunk_id}] 抽選申込みの確認ボタンのクリックに失敗しました: {user_number} - エラー詳細: {e}")
+                    with data_lock:
+                        failed_logins.append((user_number, password, user_name))
 
-                # 次のログイン試行前に1秒間待機
-                time_module.sleep(1)
-            
-            # 最終的な進捗状況を100%に設定
-            self.progress_signal.emit(100)
-            
-            # 予約情報を集計してカウント
-            self.update_signal.emit(f"予約リスト件数: {len(reservation_list)}")
-            if reservation_list:
-                self.update_signal.emit(f"サンプルデータ: {reservation_list[:3]}")
-            reservation_count = pd.Series(reservation_list).value_counts()
-            self.update_signal.emit(f"集計結果件数: {len(reservation_count)}")
-            
-            # 日本語の日付形式（例: 2024年4月10日）を解析してdatetimeオブジェクトに変換する関数
-            def parse_japanese_date(date_str):
-                pattern = r'(\d+)年(\d+)月(\d+)日'
-                match = re.match(pattern, date_str)
-                if match:
-                    year, month, day = map(int, match.groups())
-                    return datetime(year, month, day)
-                return datetime(9999, 12, 31)  # パースできない場合のフォールバック
-                
-            # reservation_countから辞書リストを作成
-            reservation_data = []
-            for key, count in reservation_count.items():
-                if isinstance(key, tuple) and len(key) == 2:
-                    date, time = key
-                    reservation_data.append({
-                        'date_str': date,
-                        'time': time,
-                        'count': count
-                    })
-                else:
-                    # タプルでない場合のエラーハンドリング
-                    self.update_signal.emit(f"予期しないキー形式: {key}")
-                    continue
-                
-            # datetimeオブジェクトでソート
-            if reservation_data:
-                reservation_data.sort(key=lambda x: parse_japanese_date(x['date_str']))
-            
-            # 集計結果をテキストファイルに書き込み
-            with open(output_file, "a", encoding="utf-8") as file:
-                file.write("=== 予約回数集計結果（日付順） ===\n")
-                for item in reservation_data:
-                    file.write(f"利用日: {item['date_str']}, 時刻: {item['time']}, 回数: {item['count']}\n")
-                
-                file.write("\n=== ログインに失敗したアカウント ===\n")
-                for user_number, password, user_name in failed_logins:
-                    file.write(f"利用者番号: {user_number}, パスワード: {password}, 氏名: {user_name}\n")
-                    
-                file.write("\n=== 申込みがされていないアカウント ===\n")
-                for user_number, password, user_name in no_bookings:
-                    file.write(f"利用者番号: {user_number}, パスワード: {password}, 氏名: {user_name}\n")
-                    
-                file.write("\n=== 申込みが1つだけのアカウント ===\n")
-                for user_number, password, user_name in one_booking:
-                    file.write(f"利用者番号: {user_number}, パスワード: {password}, 氏名: {user_name}\n")
-                    
-                # 各ユーザーの予約数を記録
-                file.write("\n=== 各ユーザーの申込み数 ===\n")
-                for (user_number, password, user_name), count in sorted(user_booking_count.items(), key=lambda x: x[1]):
-                    file.write(f"利用者番号: {user_number}, 氏名: {user_name}, 申込み数: {count}\n")
-            
-            # 集計結果を表示
-            summary = f"\n=== 集計結果 ===\n"
-            summary += f"合計確認ユーザー数: {len(users_data)}\n"
-            summary += f"ログイン失敗数: {len(failed_logins)}\n"
-            summary += f"申込みなしユーザー数: {len(no_bookings)}\n"
-            summary += f"申込み1つのみユーザー数: {len(one_booking)}\n"
-            summary += f"確認された予約総数: {sum(item['count'] for item in reservation_data)}\n"
-            summary += f"\n詳細な情報は {output_file} に保存されました。"
-            
-            self.update_signal.emit(summary)
-            
-        except Exception as e:
-            self.update_signal.emit(f"予約確認処理中にエラーが発生しました: {str(e)}")
-            raise
-        finally:
-            try:
-                driver.quit()
-            except:
-                pass
+                    time_module.sleep(1)
+
+                    with progress_lock:
+                        completed_count[0] += 1
+                        self.progress_signal.emit(int((completed_count[0] / total_users) * 100))
+
+            except Exception as e:
+                self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {str(e)}")
+            finally:
+                try:
+                    driver.quit()
+                except:
+                    pass
+
+        chunks = [users_data.iloc[i::parallel] for i in range(parallel)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = [executor.submit(process_chunk, chunk, i+1) for i, chunk in enumerate(chunks)]
+            concurrent.futures.wait(futures)
+
+        self.progress_signal.emit(100)
+
+        # 集計処理
+        def parse_japanese_date(date_str):
+            pattern = r'(\d+)年(\d+)月(\d+)日'
+            match = re.match(pattern, date_str)
+            if match:
+                year, month, day = map(int, match.groups())
+                return datetime(year, month, day)
+            return datetime(9999, 12, 31)
+
+        reservation_count = pd.Series(reservation_list).value_counts()
+        reservation_data = []
+        for key, count in reservation_count.items():
+            if isinstance(key, tuple) and len(key) == 2:
+                date, time = key
+                reservation_data.append({'date_str': date, 'time': time, 'count': count})
+        if reservation_data:
+            reservation_data.sort(key=lambda x: parse_japanese_date(x['date_str']))
+
+        with open(output_file, "a", encoding="utf-8") as file:
+            file.write("=== 予約回数集計結果（日付順） ===\n")
+            for item in reservation_data:
+                file.write(f"利用日: {item['date_str']}, 時刻: {item['time']}, 回数: {item['count']}\n")
+            file.write("\n=== ログインに失敗したアカウント ===\n")
+            for user_number, password, user_name in failed_logins:
+                file.write(f"利用者番号: {user_number}, パスワード: {password}, 氏名: {user_name}\n")
+            file.write("\n=== 申込みがされていないアカウント ===\n")
+            for user_number, password, user_name in no_bookings:
+                file.write(f"利用者番号: {user_number}, パスワード: {password}, 氏名: {user_name}\n")
+            file.write("\n=== 申込みが1つだけのアカウント ===\n")
+            for user_number, password, user_name in one_booking:
+                file.write(f"利用者番号: {user_number}, パスワード: {password}, 氏名: {user_name}\n")
+            file.write("\n=== 各ユーザーの申込み数 ===\n")
+            for (user_number, password, user_name), count in sorted(user_booking_count.items(), key=lambda x: x[1]):
+                file.write(f"利用者番号: {user_number}, 氏名: {user_name}, 申込み数: {count}\n")
+
+        summary = f"\n=== 集計結果 ===\n"
+        summary += f"合計確認ユーザー数: {total_users}\n"
+        summary += f"ログイン失敗数: {len(failed_logins)}\n"
+        summary += f"申込みなしユーザー数: {len(no_bookings)}\n"
+        summary += f"申込み1つのみユーザー数: {len(one_booking)}\n"
+        summary += f"確認された予約総数: {sum(item['count'] for item in reservation_data)}\n"
+        summary += f"\n詳細な情報は {output_file} に保存されました。"
+        self.update_signal.emit(summary)
 
     # 抽選確定処理
     def confirm_lottery_selection(self):
+        import threading
+        import concurrent.futures
+        import subprocess
+
         csv_file = self.params.get("csv_file", "Johoku1.csv")
         user_count = self.params.get("user_count", "6")
-        headless = self.params.get("headless", True)  # ヘッドレスモード設定
-        
-        # ヘッドレスモード情報をログに出力
+        headless = self.params.get("headless", True)
+        parallel = self.params.get("parallel", 2)
+
         self.update_signal.emit(f"ヘッドレスモード: {'有効' if headless else '無効'}")
-        
-        # 書き込み可能なディレクトリを取得
+        self.update_signal.emit(f"並列数: {parallel}")
+
         writable_dir = get_writable_dir()
-        # 結果を書き込むファイル名
         output_file = os.path.join(writable_dir, "lottery_results.txt")
         self.update_signal.emit(f"出力ファイル: {output_file}")
-        
-        # CSVファイルからデータを読み込み
+
         self.update_signal.emit(f"ファイル {csv_file} からユーザー情報を読み込んでいます...")
-        users_data = pd.read_csv(csv_file, dtype={
-            'user_number': str,
-            'password': str
-        })
-        
+        users_data = pd.read_csv(csv_file, dtype={'user_number': str, 'password': str})
         total_users = len(users_data)
         self.update_signal.emit(f"{total_users}人のユーザー情報を読み込みました。")
-        
-        # 集計データを格納する変数
-        reservation_summary = defaultdict(list)  # {(利用日, 時刻): [(氏名, 番号), ...]}
-        failed_logins = []  # [(利用者番号, 氏名), ...]
-        
+
+        reservation_summary = defaultdict(list)
+        failed_logins = []
+        data_lock = threading.Lock()
+        file_lock = threading.Lock()
+        completed_count = [0]
+        progress_lock = threading.Lock()
+
         with open(output_file, "w", encoding="utf-8") as file:
             file.write("===== 抽選確定処理結果 =====\n")
             file.write(f"実行日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        
-        # Chromeブラウザの起動
-        self.update_signal.emit("Chromeブラウザを起動しています...")
-        options = setup_chrome_options(headless)  # ヘッドレスモード設定を渡す
-        options.add_argument("--disable-popup-blocking")  # ポップアップを無効化
-        
-        # サービスオプションでログを無効化
-        import subprocess
-        service = Service(ChromeDriverManager().install())
-        service.creation_flags = subprocess.CREATE_NO_WINDOW  # CREATE_NO_WINDOW フラグを設定
-        service.log_path = os.devnull  # ログを無効化
-        
-        driver = webdriver.Chrome(service=service, options=options)
-        
-        try:
-            for index, row in users_data.iterrows():
-                if not self.is_running:
-                    self.update_signal.emit("処理が中断されました。")
-                    break
-                    
-                user_number = row['user_number']
-                password = row['password']
-                # 氏名情報の取得（'Kana'または'Name'があれば使用、なければuser_numberを使用）
-                user_name = row.get('Kana', row.get('Name', user_number))
-                
-                progress = int((index / total_users) * 100)
-                self.progress_signal.emit(progress)
-                
-                self.update_signal.emit(f"\nユーザー {user_number} ({user_name}) の処理を開始します... ({index+1}/{total_users})")
-                
-                # 新しいタブを開く
-                driver.execute_script("window.open('');")
-                # 新しいタブのハンドルを取得
-                new_tab = driver.window_handles[-1]
-                # 新しいタブに切り替え
-                driver.switch_to.window(new_tab)
+
+        def process_chunk(chunk_df, chunk_id):
+            driver = None
+            try:
+                options = setup_chrome_options(headless)
+                options.add_argument("--disable-popup-blocking")
+                service = Service(ChromeDriverManager().install())
+                service.creation_flags = subprocess.CREATE_NO_WINDOW
+                service.log_path = os.devnull
+                driver = webdriver.Chrome(service=service, options=options)
+
+                for index, row in chunk_df.iterrows():
+                    if not self.is_running:
+                        self.update_signal.emit(f"[スレッド{chunk_id}] 処理が中断されました。")
+                        break
+
+                    user_number = row['user_number']
+                    password = row['password']
+                    user_name = row.get('Kana', row.get('Name', user_number))
+
+                    self.update_signal.emit(f"\n[スレッド{chunk_id}] ユーザー {user_number} ({user_name}) の処理を開始します...")
+
+                    driver.execute_script("window.open('');")
+                    new_tab = driver.window_handles[-1]
+                    driver.switch_to.window(new_tab)
                 
                 login_successful = False
                 login_retry = 0
@@ -1311,136 +1286,134 @@ class WorkerThread(QThread):
                     login_retry += 1
                     self.update_signal.emit(f"ログイン失敗（試行 {login_retry}/3）: {user_number} - {e}")
                     if login_retry >= 3:
-                        failed_logins.append((user_number, user_name))
-                        with open(output_file, "a", encoding="utf-8") as file:
-                            file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
-                            file.write("  ログイン失敗（3回試行）\n\n")
+                        with data_lock:
+                            failed_logins.append((user_number, user_name))
+                        with file_lock:
+                            with open(output_file, "a", encoding="utf-8") as file:
+                                file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                                file.write("  ログイン失敗（3回試行）\n\n")
 
                 if not login_successful:
+                    with progress_lock:
+                        completed_count[0] += 1
+                        self.progress_signal.emit(int((completed_count[0] / total_users) * 100))
                     continue
 
                 try:
                     # モーダルを表示して「抽選結果」リンクをクリック
                     try:
-                        # 「抽選」メニューをクリックしてモーダルを表示
                         lottery_menu = WebDriverWait(driver, 10).until(
                             EC.element_to_be_clickable((By.XPATH, "//a[@data-target='#modal-menus']"))
                         )
                         driver.execute_script("arguments[0].click();", lottery_menu)
-                        
-                        # モーダル内の「抽選結果」リンクをクリック
+
                         result_button = WebDriverWait(driver, 10).until(
                             EC.element_to_be_clickable((By.XPATH, "//a[text()='抽選結果']"))
                         )
                         driver.execute_script("arguments[0].click();", result_button)
                         self.update_signal.emit(f"抽選結果ボタンをクリック: {user_number}")
-                        
-                        # 当選結果のテーブルが表示されるまで待機
+
                         try:
-                            # 全落選時のメッセージを先に確認してすぐスキップ
                             no_result_elements = driver.find_elements(By.XPATH, "//*[contains(text(), '該当する抽選はありません')]")
                             if no_result_elements:
                                 self.update_signal.emit(f"ユーザー {user_number}: 該当する抽選はありません")
-                                with open(output_file, "a", encoding="utf-8") as file:
-                                    file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
-                                    file.write("  該当する抽選はありません\n\n")
+                                with file_lock:
+                                    with open(output_file, "a", encoding="utf-8") as file:
+                                        file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                                        file.write("  該当する抽選はありません\n\n")
                                 driver.close()
                                 driver.switch_to.window(driver.window_handles[0])
+                                with progress_lock:
+                                    completed_count[0] += 1
+                                    self.progress_signal.emit(int((completed_count[0] / total_users) * 100))
                                 continue
 
                             WebDriverWait(driver, 3).until(
                                 EC.presence_of_element_located((By.XPATH, "//table[@class='table sp-block-table']/tbody/tr"))
                             )
 
-                            # 当選結果の情報を取得し、選択ボタンをクリック
                             rows = driver.find_elements(By.XPATH, "//table[@class='table sp-block-table']/tbody/tr")
 
                             if rows:
-                                with open(output_file, "a", encoding="utf-8") as file:
-                                    file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
-                                
+                                local_bookings = []
                                 for row in rows:
                                     try:
                                         booking_date = row.find_element(By.XPATH, ".//td[2]/label/span[2]").text
                                         booking_time = row.find_element(By.XPATH, ".//td[3]/label").text
-                                        
-                                        # 集計データに追加
-                                        reservation_summary[(booking_date, booking_time)].append((user_name, user_number))
-                                        
-                                        # ファイルに書き込む
-                                        with open(output_file, "a", encoding="utf-8") as file:
-                                            file.write(f"  日付: {booking_date}, 時間: {booking_time}\n")
+                                        local_bookings.append((booking_date, booking_time))
                                         self.update_signal.emit(f"当選情報: {user_name},{booking_date},{booking_time}")
-                                        
-                                        # 選択ボタンをクリック (JavaScriptでクリック)
                                         select_button = row.find_element(By.XPATH, ".//input[@name='checkElect']")
                                         driver.execute_script("arguments[0].click();", select_button)
                                     except Exception as e:
                                         self.update_signal.emit(f"行の処理に失敗: {str(e)}")
-                                
-                                # 確認ボタンをクリック (JavaScriptでクリック)
+
+                                with data_lock:
+                                    for booking_date, booking_time in local_bookings:
+                                        reservation_summary[(booking_date, booking_time)].append((user_name, user_number))
+
+                                with file_lock:
+                                    with open(output_file, "a", encoding="utf-8") as file:
+                                        file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                                        for booking_date, booking_time in local_bookings:
+                                            file.write(f"  日付: {booking_date}, 時間: {booking_time}\n")
+
                                 try:
                                     confirm_button = driver.find_element(By.ID, "btn-go")
                                     driver.execute_script("arguments[0].click();", confirm_button)
                                     self.update_signal.emit(f"確認ボタンをクリック: {user_number}")
-                                    
-                                    # 利用人数の入力ページが表示されるまで待機
                                     WebDriverWait(driver, 10).until(
                                         EC.presence_of_element_located((By.XPATH, "//input[@name='applyNum']"))
                                     )
-                                    
-                                    # 利用人数を入力
                                     user_count_inputs = driver.find_elements(By.XPATH, "//input[@name='applyNum']")
                                     for input_field in user_count_inputs:
-                                        input_field.clear()  # 既存の入力をクリア
-                                        input_field.send_keys(user_count)  # 指定された利用人数を設定
-                                    
-                                    # 確認ボタンをクリック (JavaScriptでクリック)
+                                        input_field.clear()
+                                        input_field.send_keys(user_count)
                                     final_confirm_button = driver.find_element(By.XPATH, "//button[contains(text(), '確認')]")
                                     driver.execute_script("arguments[0].click();", final_confirm_button)
                                     self.update_signal.emit(f"最終確認ボタンをクリック: {user_number}")
-                                    
-                                    # ポップアップの確認とOKボタンをクリック
                                     try:
                                         alert = WebDriverWait(driver, 5).until(EC.alert_is_present())
                                         alert.accept()
                                         self.update_signal.emit(f"ポップアップのOKボタンをクリック: {user_number}")
-                                        with open(output_file, "a", encoding="utf-8") as file:
-                                            file.write("  処理結果: 確定成功\n\n")
+                                        with file_lock:
+                                            with open(output_file, "a", encoding="utf-8") as file:
+                                                file.write("  処理結果: 確定成功\n\n")
                                     except:
                                         self.update_signal.emit(f"ポップアップは表示されませんでした: {user_number}")
-                                        with open(output_file, "a", encoding="utf-8") as file:
-                                            file.write("  処理結果: 確定処理完了（ポップアップなし）\n\n")
+                                        with file_lock:
+                                            with open(output_file, "a", encoding="utf-8") as file:
+                                                file.write("  処理結果: 確定処理完了（ポップアップなし）\n\n")
                                 except Exception as e:
                                     self.update_signal.emit(f"確定処理中にエラー: {str(e)}")
-                                    with open(output_file, "a", encoding="utf-8") as file:
-                                        file.write(f"  処理結果: 確定処理エラー - {str(e)}\n\n")
+                                    with file_lock:
+                                        with open(output_file, "a", encoding="utf-8") as file:
+                                            file.write(f"  処理結果: 確定処理エラー - {str(e)}\n\n")
                             else:
                                 self.update_signal.emit(f"ユーザー {user_number} に当選情報がありません")
-                                with open(output_file, "a", encoding="utf-8") as file:
-                                    file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
-                                    file.write("  当選情報なし\n\n")
+                                with file_lock:
+                                    with open(output_file, "a", encoding="utf-8") as file:
+                                        file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                                        file.write("  当選情報なし\n\n")
                         except Exception as e:
-                            # Stacktraceを含まないシンプルなエラーメッセージに変更
                             error_msg = "要素が見つかりません" if "element" in str(e).lower() else "エラーが発生しました"
                             self.update_signal.emit(f"当選テーブルが見つかりません: {user_number} - {error_msg}")
-                            with open(output_file, "a", encoding="utf-8") as file:
-                                file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
-                                file.write("  当選テーブルなし\n\n")
-                        
+                            with file_lock:
+                                with open(output_file, "a", encoding="utf-8") as file:
+                                    file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                                    file.write("  当選テーブルなし\n\n")
+
                     except Exception as e:
-                        # Stacktraceを含まないシンプルなエラーメッセージに変更
                         error_msg = "処理エラー"
                         if "timeout" in str(e).lower():
                             error_msg = "タイムアウト"
                         elif "element" in str(e).lower():
                             error_msg = "要素が見つかりません"
                         self.update_signal.emit(f"抽選結果の処理に失敗しました: {user_number} - {error_msg}")
-                        with open(output_file, "a", encoding="utf-8") as file:
-                            file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
-                            file.write(f"  エラー: 抽選結果の処理に失敗 - {error_msg}\n\n")
-                    
-                    # 次のログイン試行前に待機
+                        with file_lock:
+                            with open(output_file, "a", encoding="utf-8") as file:
+                                file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                                file.write(f"  エラー: 抽選結果の処理に失敗 - {error_msg}\n\n")
+
                     time_module.sleep(1)
                     
                 except Exception as e:
@@ -1457,102 +1430,107 @@ class WorkerThread(QThread):
                         file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
                         file.write(f"  エラー: {error_msg}\n\n")
             
-            # 最終的な進捗状況を100%に設定
-            self.progress_signal.emit(100)
-            
-            # 集計結果をファイルに追記
-            with open(output_file, "a", encoding="utf-8") as file:
-                file.write("\n===== 予約回数集計結果 =====\n")
-                
-                # 利用日でソート
-                sorted_reservations = sorted(reservation_summary.items(), key=lambda x: x[0][0])
-                
-                for (booking_date, booking_time), users in sorted_reservations:
-                    file.write(f"利用日: {booking_date}, 時刻: {booking_time}, 面数: {len(users)}\n")
-                    for user_name, user_number in users:
-                        file.write(f"    利用者氏名: {user_name}, 利用者番号: {user_number}\n")
-                
-                # ログイン失敗したアカウントを記録
-                if failed_logins:
-                    file.write("\n===== ログインに失敗したアカウント =====\n")
-                    for user_number, user_name in failed_logins:
-                        file.write(f"利用者番号: {user_number}, 氏名: {user_name}\n")
-            
-            # 処理完了メッセージ
-            self.update_signal.emit("\n抽選確定処理が完了しました")
-            self.update_signal.emit(f"結果は {output_file} に保存されました")
-            
-        except Exception as e:
-            self.update_signal.emit(f"抽選確定処理中にエラーが発生しました: {str(e)}")
-            raise
-        finally:
-            try:
-                driver.quit()
-            except:
-                pass
+                except Exception as e:
+                    error_msg = "処理エラー"
+                    if "timeout" in str(e).lower():
+                        error_msg = "タイムアウト"
+                    elif "element" in str(e).lower():
+                        error_msg = "要素が見つかりません"
+                    elif "alert" in str(e).lower():
+                        error_msg = "アラート処理エラー"
+                    self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {error_msg}")
+                    with file_lock:
+                        with open(output_file, "a", encoding="utf-8") as file:
+                            file.write(f"ユーザー: {user_name} (ID: {user_number})\n")
+                            file.write(f"  エラー: {error_msg}\n\n")
+
+                    with progress_lock:
+                        completed_count[0] += 1
+                        self.progress_signal.emit(int((completed_count[0] / total_users) * 100))
+
+            except Exception as e:
+                self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {str(e)}")
+            finally:
+                try:
+                    driver.quit()
+                except:
+                    pass
+
+        chunks = [users_data.iloc[i::parallel] for i in range(parallel)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = [executor.submit(process_chunk, chunk, i+1) for i, chunk in enumerate(chunks)]
+            concurrent.futures.wait(futures)
+
+        self.progress_signal.emit(100)
+
+        with open(output_file, "a", encoding="utf-8") as file:
+            file.write("\n===== 予約回数集計結果 =====\n")
+            sorted_reservations = sorted(reservation_summary.items(), key=lambda x: x[0][0])
+            for (booking_date, booking_time), users in sorted_reservations:
+                file.write(f"利用日: {booking_date}, 時刻: {booking_time}, 面数: {len(users)}\n")
+                for user_name, user_number in users:
+                    file.write(f"    利用者氏名: {user_name}, 利用者番号: {user_number}\n")
+            if failed_logins:
+                file.write("\n===== ログインに失敗したアカウント =====\n")
+                for user_number, user_name in failed_logins:
+                    file.write(f"利用者番号: {user_number}, 氏名: {user_name}\n")
+
+        self.update_signal.emit("\n抽選確定処理が完了しました")
+        self.update_signal.emit(f"結果は {output_file} に保存されました")
 
     # 予約状況の確認処理
     def check_reservation_status(self):
+        import threading
+        import concurrent.futures
+
         csv_file = self.params.get("csv_file", "Johoku1.csv")
-        headless = self.params.get("headless", True)  # ヘッドレスモード設定
-        
-        # ヘッドレスモード情報をログに出力
+        headless = self.params.get("headless", True)
+        parallel = self.params.get("parallel", 2)
+
         self.update_signal.emit(f"ヘッドレスモード: {'有効' if headless else '無効'}")
-        
-        # CSVファイルからデータを読み込み
+        self.update_signal.emit(f"並列数: {parallel}")
         self.update_signal.emit(f"ファイル {csv_file} からユーザー情報を読み込んでいます...")
-        users_data = pd.read_csv(csv_file, dtype={
-            'user_number': str,
-            'password': str
-        })
-        
+        users_data = pd.read_csv(csv_file, dtype={'user_number': str, 'password': str})
         total_users = len(users_data)
         self.update_signal.emit(f"{total_users}人のユーザー情報を読み込みました。")
-        
-        # 日付と時刻の組み合わせを保存するリスト
+
         reservation_list = []
-        # ログインに失敗したアカウントを保存するリスト
         failed_logins = []
-        
-        # 書き込み可能なディレクトリを取得
+        data_lock = threading.Lock()
+        file_lock = threading.Lock()
+        completed_count = [0]
+        progress_lock = threading.Lock()
+
         writable_dir = get_writable_dir()
-        # 結果を書き込むファイル名
         result_file = os.path.join(writable_dir, "r_info.txt")
         self.update_signal.emit(f"出力ファイル: {result_file}")
-        
-        # ファイルが存在する場合は削除
+
         if os.path.exists(result_file):
             os.remove(result_file)
-        
-        # 結果ファイルの初期化
         with open(result_file, "w", encoding="utf-8") as file:
             file.write(f"=== 予約状況確認 ===\n")
             file.write(f"実行日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        
-        # Chromeブラウザの起動
-        self.update_signal.emit("Chromeブラウザを起動しています...")
-        options = setup_chrome_options(headless)  # ヘッドレスモード設定を渡す
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-        
-        try:
-            for index, row in users_data.iterrows():
-                if not self.is_running:
-                    self.update_signal.emit("処理が中断されました。")
-                    break
-                    
-                user_number = row['user_number']
-                password = row['password']
-                user_name = row.get('Name', '不明')  # Name列がない場合は'不明'を使用
-                
-                progress = int((index / total_users) * 100)
-                self.progress_signal.emit(progress)
-                
-                self.update_signal.emit(f"\nユーザー {user_number} の処理を開始します... ({index+1}/{total_users})")
-                
-                # 新しいタブを開く
-                driver.execute_script("window.open('');")
-                new_tab = driver.window_handles[-1]
-                driver.switch_to.window(new_tab)
+
+        def process_chunk(chunk_df, chunk_id):
+            driver = None
+            try:
+                options = setup_chrome_options(headless)
+                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+
+                for index, row in chunk_df.iterrows():
+                    if not self.is_running:
+                        self.update_signal.emit(f"[スレッド{chunk_id}] 処理が中断されました。")
+                        break
+
+                    user_number = row['user_number']
+                    password = row['password']
+                    user_name = row.get('Name', '不明')
+
+                    self.update_signal.emit(f"\n[スレッド{chunk_id}] ユーザー {user_number} の処理を開始します...")
+
+                    driver.execute_script("window.open('');")
+                    new_tab = driver.window_handles[-1]
+                    driver.switch_to.window(new_tab)
                 
                 login_successful = False
                 login_retry = 0
@@ -1712,146 +1690,132 @@ class WorkerThread(QThread):
                         file.write("---------------\n")
 
                 except Exception as e:
-                    self.update_signal.emit(f"ユーザー {user_number} の処理中にエラーが発生しました - エラー詳細: {e}")
-                    failed_logins.append((user_number, password, user_name))
-                    with open(result_file, "a", encoding="utf-8") as file:
-                        file.write(f"エラー: {str(e)}\n")
-                        file.write("---------------\n")
-                
-                # 次のログイン試行前に待機
+                    self.update_signal.emit(f"[スレッド{chunk_id}] ユーザー {user_number} の処理中にエラー: {e}")
+                    with data_lock:
+                        failed_logins.append((user_number, password, user_name))
+                    with file_lock:
+                        with open(result_file, "a", encoding="utf-8") as file:
+                            file.write(f"エラー: {str(e)}\n")
+                            file.write("---------------\n")
+
                 time_module.sleep(0.1)
-            
-            # 最終的な進捗状況を100%に設定
-            self.progress_signal.emit(100)
-            
-            # 予約情報がある場合は集計処理
-            try:
-                if reservation_list:
-                    # 予約情報をDataFrameに変換し、ソートする
-                    df = pd.DataFrame(reservation_list, columns=['利用日', '時刻', '氏名', '利用者番号'])
-                    
-                    # 日付と時刻のフォーマットを修正
-                    df['利用日'] = df['利用日'].apply(lambda x: x.replace('\n', ' ').strip())
-                    df['時刻'] = df['時刻'].apply(lambda x: x.split('～')[0].strip() if '～' in x else x)
-                    
-                    # 日付をdatetimeオブジェクトに変換する関数
-                    def parse_date(date_str):
-                        # 月、日、年を個別に抽出
-                        month_match = re.search(r'(\d+)月', date_str)
-                        day_match = re.search(r'(\d+)日', date_str)
-                        year_match = re.search(r'(\d{4})年', date_str)
-                        
-                        if month_match and day_match and year_match:
-                            month = int(month_match.group(1))
-                            day = int(day_match.group(1))
-                            year = int(year_match.group(1))
-                            return datetime(year, month, day)
-                        else:
-                            return pd.NaT  # 解析できない場合は NaT (Not a Time) を返す
-                    
-                    # 日付を datetime オブジェクトに変換
-                    df['利用日'] = df['利用日'].apply(parse_date)
-                    
-                    # 無効な日付を削除
-                    df = df.dropna(subset=['利用日'])
-                    
-                    # ソート
-                    df = df.sort_values(by=['利用日', '時刻'])
-                    
-                    # 集計結果をテキストファイルに書き込み
-                    with open(result_file, "a", encoding="utf-8") as file:
-                        file.write("\n=== 予約回数集計結果 ===\n")
-                        if df.empty:
-                            file.write("有効な予約情報がありません。\n")
-                        else:
-                            grouped = df.groupby(['利用日', '時刻'])
-                            for (date, time_val), group in grouped:
-                                file.write(f"利用日: {date.strftime('%Y年%m月%d日')}, 時刻: {time_val}, 面数: {len(group)}\n")
-                                for _, row in group.iterrows():
-                                    file.write(f"\t利用者氏名: {row['氏名']}, 利用者番号: {row['利用者番号']}\n")
-                else:
-                    self.update_signal.emit("予約情報が存在しません。")
-                    with open(result_file, "a", encoding="utf-8") as file:
-                        file.write("\n=== 予約回数集計結果 ===\n")
-                        file.write("予約情報が存在しません。\n")
+                with progress_lock:
+                    completed_count[0] += 1
+                    self.progress_signal.emit(int((completed_count[0] / total_users) * 100))
+
             except Exception as e:
-                self.update_signal.emit(f"集計処理中にエラーが発生しました: {e}")
+                self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {str(e)}")
+            finally:
+                try:
+                    driver.quit()
+                except:
+                    pass
+
+        chunks = [users_data.iloc[i::parallel] for i in range(parallel)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = [executor.submit(process_chunk, chunk, i+1) for i, chunk in enumerate(chunks)]
+            concurrent.futures.wait(futures)
+
+        self.progress_signal.emit(100)
+
+        try:
+            if reservation_list:
+                df = pd.DataFrame(reservation_list, columns=['利用日', '時刻', '氏名', '利用者番号'])
+                df['利用日'] = df['利用日'].apply(lambda x: x.replace('\n', ' ').strip())
+                df['時刻'] = df['時刻'].apply(lambda x: x.split('～')[0].strip() if '～' in x else x)
+
+                def parse_date(date_str):
+                    month_match = re.search(r'(\d+)月', date_str)
+                    day_match = re.search(r'(\d+)日', date_str)
+                    year_match = re.search(r'(\d{4})年', date_str)
+                    if month_match and day_match and year_match:
+                        return datetime(int(year_match.group(1)), int(month_match.group(1)), int(day_match.group(1)))
+                    return pd.NaT
+
+                df['利用日'] = df['利用日'].apply(parse_date)
+                df = df.dropna(subset=['利用日']).sort_values(by=['利用日', '時刻'])
+
                 with open(result_file, "a", encoding="utf-8") as file:
                     file.write("\n=== 予約回数集計結果 ===\n")
-                    file.write(f"集計処理中にエラーが発生しました: {e}\n")
-            
-            # ログイン失敗したアカウントの情報を出力
-            if failed_logins:
-                self.update_signal.emit("\nログインに失敗したアカウント:")
+                    if df.empty:
+                        file.write("有効な予約情報がありません。\n")
+                    else:
+                        grouped = df.groupby(['利用日', '時刻'])
+                        for (date, time_val), group in grouped:
+                            file.write(f"利用日: {date.strftime('%Y年%m月%d日')}, 時刻: {time_val}, 面数: {len(group)}\n")
+                            for _, row in group.iterrows():
+                                file.write(f"\t利用者氏名: {row['氏名']}, 利用者番号: {row['利用者番号']}\n")
+            else:
                 with open(result_file, "a", encoding="utf-8") as file:
-                    file.write("\n=== ログインに失敗したアカウント ===\n")
-                    for user_number, password, user_name in failed_logins:
-                        file.write(f"利用者番号: {user_number}, 氏名: {user_name}\n")
-                        self.update_signal.emit(f"利用者番号: {user_number}, 氏名: {user_name}")
-            
-            self.update_signal.emit("\n予約状況の確認が完了しました")
-            self.update_signal.emit(f"結果は {result_file} に保存されました")
-        
+                    file.write("\n=== 予約回数集計結果 ===\n")
+                    file.write("予約情報が存在しません。\n")
         except Exception as e:
-            self.update_signal.emit(f"予約状況確認処理中にエラーが発生しました: {str(e)}")
-            raise
-        finally:
-            try:
-                driver.quit()
-            except:
-                pass
+            with open(result_file, "a", encoding="utf-8") as file:
+                file.write(f"\n集計処理中にエラーが発生しました: {e}\n")
+
+        if failed_logins:
+            with open(result_file, "a", encoding="utf-8") as file:
+                file.write("\n=== ログインに失敗したアカウント ===\n")
+                for user_number, password, user_name in failed_logins:
+                    file.write(f"利用者番号: {user_number}, 氏名: {user_name}\n")
+
+        self.update_signal.emit("\n予約状況の確認が完了しました")
+        self.update_signal.emit(f"結果は {result_file} に保存されました")
 
     # 有効期限の確認処理
     def check_account_expiry(self):
+        import threading
+        import concurrent.futures
+
         csv_file = self.params.get("csv_file", "Johoku1.csv")
-        headless = self.params.get("headless", True)  # ヘッドレスモード設定
-        
-        # CSVファイルからデータを読み込み
+        headless = self.params.get("headless", True)
+        parallel = self.params.get("parallel", 2)
+
         self.update_signal.emit(f"ファイル {csv_file} からユーザー情報を読み込んでいます...")
         self.update_signal.emit(f"ヘッドレスモード: {'有効' if headless else '無効'}")
-        
-        users_data = pd.read_csv(csv_file, dtype={
-            'user_number': str,
-            'password': str
-        })
-        
+        self.update_signal.emit(f"並列数: {parallel}")
+
+        users_data = pd.read_csv(csv_file, dtype={'user_number': str, 'password': str})
         total_users = len(users_data)
         self.update_signal.emit(f"{total_users}人のユーザー情報を読み込みました。")
-        
-        # 書き込み可能なディレクトリを取得
+
         writable_dir = get_writable_dir()
-        # 結果を書き込むファイル名（フルパス）
         output_file = os.path.join(writable_dir, "expiry.txt")
         self.update_signal.emit(f"出力ファイル: {output_file}")
-        
-        # 結果を一時的にリストに保存
+
         results = []
-        
-        # Chromeブラウザの起動
-        self.update_signal.emit("Chromeブラウザを起動しています...")
-        options = setup_chrome_options(headless)  # ヘッドレスモード設定を渡す
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-popup-blocking')
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-        wait = WebDriverWait(driver, 10)
-        
-        try:
-            self.update_signal.emit(f"=== アカウント有効期限の確認 ===")
-            self.update_signal.emit(f"実行日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            for index, row in users_data.iterrows():
-                if not self.is_running:
-                    self.update_signal.emit("処理が中断されました。")
-                    break
-                    
-                user_number = row['user_number']
-                password = row['password']
-                # 'Kana'または'Name'があれば使用、なければuser_numberを使用
-                user_name = row.get('Kana', row.get('Name', user_number))
-                
-                progress = int((index / total_users) * 100)
-                self.progress_signal.emit(progress)
+        data_lock = threading.Lock()
+        completed_count = [0]
+        progress_lock = threading.Lock()
+
+        self.update_signal.emit(f"=== アカウント有効期限の確認 ===")
+        self.update_signal.emit(f"実行日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        def process_chunk(chunk_df, chunk_id):
+            driver = None
+            try:
+                options = setup_chrome_options(headless)
+                options.add_argument('--no-sandbox')
+                options.add_argument('--disable-dev-shm-usage')
+                options.add_argument('--disable-popup-blocking')
+                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                wait = WebDriverWait(driver, 10)
+
+                for index, row in chunk_df.iterrows():
+                    if not self.is_running:
+                        self.update_signal.emit(f"[スレッド{chunk_id}] 処理が中断されました。")
+                        break
+
+                    user_number = row['user_number']
+                    password = row['password']
+                    user_name = row.get('Kana', row.get('Name', user_number))
+
+                    self.update_signal.emit(f"\n[スレッド{chunk_id}] ユーザー {user_number} の処理を開始します...")
+
+                    driver.execute_script("window.open('');")
+                    driver.switch_to.window(driver.window_handles[-1])
+
+                    progress = 0  # 進捗はcompleted_countで管理
                 
                 self.update_signal.emit(f"\nユーザー {user_number} の処理を開始します... ({index+1}/{total_users})")
                 
@@ -1991,54 +1955,54 @@ class WorkerThread(QThread):
                         })
 
                 except Exception as e:
-                    self.update_signal.emit(f"ユーザー {user_number} の処理中にエラーが発生: {str(e)}")
-                    results.append({
-                        'user_number': user_number,
-                        'user_name': user_name,
-                        'expiry_info': "エラー発生",
-                        'expiry_date': datetime(9999, 12, 31)  # 遠い未来の日付
-                    })
-                
-                # 次のユーザーの処理前に待機
+                    self.update_signal.emit(f"[スレッド{chunk_id}] ユーザー {user_number} の処理中にエラー: {str(e)}")
+                    with data_lock:
+                        results.append({
+                            'user_number': user_number,
+                            'user_name': user_name,
+                            'expiry_info': "エラー発生",
+                            'expiry_date': datetime(9999, 12, 31)
+                        })
+
                 time_module.sleep(0.5)
-            
-            # 最終的な進捗状況を100%に設定
-            self.progress_signal.emit(100)
-            
-            # 日付でソート
-            results.sort(key=lambda x: x['expiry_date'])
-            
-            # ソート済みデータを書き込む
-            with open(output_file, "w", encoding="utf-8") as file:
-                file.write("利用者番号,氏名,有効期限\n")
-                for result in results:
-                    file.write(f"{result['user_number']},{result['user_name']},{result['expiry_info']}\n")
-            
-            self.update_signal.emit("\nすべてのデータの書き込みが完了しました")
-            self.update_signal.emit(f"結果は {output_file} に保存されました")
-            
-            # 今日から2週間以内に有効期限が切れるユーザーを表示
-            today = datetime.now()
-            from datetime import timedelta
-            two_weeks_later = today + timedelta(days=14)  # 今日から2週間後
-            
-            self.update_signal.emit("\n=== 有効期限が2週間以内に切れるユーザー ===")
-            expiring_soon = [r for r in results if r['expiry_date'] <= two_weeks_later and r['expiry_date'] != datetime(9999, 12, 31)]
-            
-            if expiring_soon:
-                for result in expiring_soon:
-                    self.update_signal.emit(f"利用者番号: {result['user_number']}, 氏名: {result['user_name']}, 有効期限: {result['expiry_info']}")
-            else:
-                self.update_signal.emit("2週間以内に有効期限が切れるユーザーはいません。")
-        
-        except Exception as e:
-            self.update_signal.emit(f"有効期限確認処理中にエラーが発生しました: {str(e)}")
-            raise
-        finally:
-            try:
-                driver.quit()
-            except:
-                pass
+                with progress_lock:
+                    completed_count[0] += 1
+                    self.progress_signal.emit(int((completed_count[0] / total_users) * 100))
+
+            except Exception as e:
+                self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {str(e)}")
+            finally:
+                try:
+                    driver.quit()
+                except:
+                    pass
+
+        chunks = [users_data.iloc[i::parallel] for i in range(parallel)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = [executor.submit(process_chunk, chunk, i+1) for i, chunk in enumerate(chunks)]
+            concurrent.futures.wait(futures)
+
+        self.progress_signal.emit(100)
+
+        results.sort(key=lambda x: x['expiry_date'])
+        with open(output_file, "w", encoding="utf-8") as file:
+            file.write("利用者番号,氏名,有効期限\n")
+            for result in results:
+                file.write(f"{result['user_number']},{result['user_name']},{result['expiry_info']}\n")
+
+        self.update_signal.emit("\nすべてのデータの書き込みが完了しました")
+        self.update_signal.emit(f"結果は {output_file} に保存されました")
+
+        from datetime import timedelta
+        today = datetime.now()
+        two_weeks_later = today + timedelta(days=14)
+        self.update_signal.emit("\n=== 有効期限が2週間以内に切れるユーザー ===")
+        expiring_soon = [r for r in results if r['expiry_date'] <= two_weeks_later and r['expiry_date'] != datetime(9999, 12, 31)]
+        if expiring_soon:
+            for result in expiring_soon:
+                self.update_signal.emit(f"利用者番号: {result['user_number']}, 氏名: {result['user_name']}, 有効期限: {result['expiry_info']}")
+        else:
+            self.update_signal.emit("2週間以内に有効期限が切れるユーザーはいません。")
 
             
 # メインアプリケーションクラス
@@ -2274,9 +2238,19 @@ class JohokuApp(QMainWindow):
         
         # ヘッドレスモード選択（追加）
         self.check_status_headless_checkbox = QCheckBox("ヘッドレスモード（ブラウザ非表示）")
-        self.check_status_headless_checkbox.setChecked(True)  # デフォルトはオン
+        self.check_status_headless_checkbox.setChecked(True)
         layout.addWidget(self.check_status_headless_checkbox)
-        
+
+        parallel_layout = QHBoxLayout()
+        parallel_layout.addWidget(QLabel("並列数:"))
+        self.check_status_parallel_spinbox = QSpinBox()
+        self.check_status_parallel_spinbox.setMinimum(1)
+        self.check_status_parallel_spinbox.setMaximum(5)
+        self.check_status_parallel_spinbox.setValue(2)
+        parallel_layout.addWidget(self.check_status_parallel_spinbox)
+        parallel_layout.addStretch()
+        layout.addLayout(parallel_layout)
+
         # 実行ボタン
         self.check_status_button = QPushButton("申込状況を確認")
         self.check_status_button.setMinimumHeight(40)
@@ -2344,9 +2318,19 @@ class JohokuApp(QMainWindow):
         
         # ヘッドレスモード選択（追加）
         self.confirm_headless_checkbox = QCheckBox("ヘッドレスモード（ブラウザ非表示）")
-        self.confirm_headless_checkbox.setChecked(True)  # デフォルトはオン
+        self.confirm_headless_checkbox.setChecked(True)
         layout.addWidget(self.confirm_headless_checkbox)
-        
+
+        parallel_layout = QHBoxLayout()
+        parallel_layout.addWidget(QLabel("並列数:"))
+        self.confirm_parallel_spinbox = QSpinBox()
+        self.confirm_parallel_spinbox.setMinimum(1)
+        self.confirm_parallel_spinbox.setMaximum(5)
+        self.confirm_parallel_spinbox.setValue(2)
+        parallel_layout.addWidget(self.confirm_parallel_spinbox)
+        parallel_layout.addStretch()
+        layout.addLayout(parallel_layout)
+
         # 実行ボタン
         self.confirm_button = QPushButton("抽選確定処理を実行")
         self.confirm_button.setMinimumHeight(40)
@@ -2407,9 +2391,19 @@ class JohokuApp(QMainWindow):
         
         # ヘッドレスモード選択（追加）
         self.reservation_headless_checkbox = QCheckBox("ヘッドレスモード（ブラウザ非表示）")
-        self.reservation_headless_checkbox.setChecked(True)  # デフォルトはオン
+        self.reservation_headless_checkbox.setChecked(True)
         layout.addWidget(self.reservation_headless_checkbox)
-        
+
+        parallel_layout = QHBoxLayout()
+        parallel_layout.addWidget(QLabel("並列数:"))
+        self.reservation_parallel_spinbox = QSpinBox()
+        self.reservation_parallel_spinbox.setMinimum(1)
+        self.reservation_parallel_spinbox.setMaximum(5)
+        self.reservation_parallel_spinbox.setValue(2)
+        parallel_layout.addWidget(self.reservation_parallel_spinbox)
+        parallel_layout.addStretch()
+        layout.addLayout(parallel_layout)
+
         # 実行ボタン
         self.reservation_button = QPushButton("予約状況を確認")
         self.reservation_button.setMinimumHeight(40)
@@ -2470,9 +2464,19 @@ class JohokuApp(QMainWindow):
         
         # ヘッドレスモード選択（追加）
         self.expiry_headless_checkbox = QCheckBox("ヘッドレスモード（ブラウザ非表示）")
-        self.expiry_headless_checkbox.setChecked(True)  # デフォルトはオン
+        self.expiry_headless_checkbox.setChecked(True)
         layout.addWidget(self.expiry_headless_checkbox)
-        
+
+        parallel_layout = QHBoxLayout()
+        parallel_layout.addWidget(QLabel("並列数:"))
+        self.expiry_parallel_spinbox = QSpinBox()
+        self.expiry_parallel_spinbox.setMinimum(1)
+        self.expiry_parallel_spinbox.setMaximum(5)
+        self.expiry_parallel_spinbox.setValue(2)
+        parallel_layout.addWidget(self.expiry_parallel_spinbox)
+        parallel_layout.addStretch()
+        layout.addLayout(parallel_layout)
+
         # 実行ボタン
         self.expiry_button = QPushButton("有効期限を確認")
         self.expiry_button.setMinimumHeight(40)
@@ -2715,9 +2719,10 @@ class JohokuApp(QMainWindow):
         # パラメータを設定
         params = {
             "csv_file": csv_file,
-            "headless": headless  # ヘッドレスモード設定を追加
+            "headless": headless,
+            "parallel": self.check_status_parallel_spinbox.value()
         }
-        
+
         # ワーカースレッドを作成・起動
         self.worker = WorkerThread("check_lottery_status", params)
         self.worker.update_signal.connect(lambda msg: self.check_status_log.append(msg))
@@ -2768,7 +2773,8 @@ class JohokuApp(QMainWindow):
         params = {
             "csv_file": csv_file,
             "user_count": user_count,
-            "headless": headless  # ヘッドレスモード設定を追加
+            "headless": headless,
+            "parallel": self.confirm_parallel_spinbox.value()
         }
         
         # ワーカースレッドを作成・起動
@@ -2804,9 +2810,10 @@ class JohokuApp(QMainWindow):
         # パラメータを設定
         params = {
             "csv_file": csv_file,
-            "headless": headless  # ヘッドレスモード設定を追加
+            "headless": headless,
+            "parallel": self.reservation_parallel_spinbox.value()
         }
-        
+
         # ワーカースレッドを作成・起動
         self.worker = WorkerThread("check_reservation", params)
         self.worker.update_signal.connect(lambda msg: self.reservation_log.append(msg))
@@ -2840,9 +2847,10 @@ class JohokuApp(QMainWindow):
         # パラメータを設定
         params = {
             "csv_file": csv_file,
-            "headless": headless  # ヘッドレスモード設定を追加
+            "headless": headless,
+            "parallel": self.expiry_parallel_spinbox.value()
         }
-        
+
         # ワーカースレッドを作成・起動
         self.worker = WorkerThread("check_expiry", params)
         self.worker.update_signal.connect(lambda msg: self.expiry_log.append(msg))
