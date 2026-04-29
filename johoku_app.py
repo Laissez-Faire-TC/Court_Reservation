@@ -42,6 +42,7 @@ from selenium.webdriver.common.alert import Alert
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
+import undetected_chromedriver as uc
 
 # ウェブサイトのURL（グローバル変数として定義）
 URL = "https://kouen.sports.metro.tokyo.lg.jp/web/"
@@ -107,35 +108,20 @@ def reload_page_on_server_down(driver, max_retries=3, wait_time=60):
 
 def setup_chrome_options(headless=True):
     """Chromeブラウザのオプションを設定する関数"""
-    options = webdriver.ChromeOptions()
-    
-    if headless:
-        # ヘッドレスモードを有効化
-        options.add_argument('--headless')
-        options.add_argument('--disable-gpu')  # WindowsでのGPU問題回避
-        options.add_argument('--no-sandbox')  # 一部環境でのサンドボックス問題回避
-        options.add_argument('--disable-dev-shm-usage')  # 共有メモリ不足問題回避
-        
-        # ウィンドウサイズを明示的に設定（ヘッドレスモードではデフォルトが小さい場合あり）
-        options.add_argument('--window-size=1920,1080')
-        
-        # ユーザーエージェントを設定（ヘッドレスの検出を避けるため）
-        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36')
+    options = uc.ChromeOptions()
+
+    # ウィンドウサイズを明示的に設定
+    options.add_argument('--window-size=1920,1080')
 
     # 一般的な設定
-    options.add_argument('--disable-extensions')  # 拡張機能を無効化
     options.add_argument('--disable-popup-blocking')  # ポップアップブロックを無効化
-    
+
     # エラーログを抑制
-    options.add_argument('--log-level=3')  # INFO, WARNING, ERROR を非表示
-    options.add_argument('--disable-logging')  # ログ出力を無効化
-    options.add_argument('--silent')  # Silent mode
-    options.add_argument('--disable-background-timer-throttling')  # バックグラウンドタイマー抑制
-    options.add_argument('--disable-renderer-backgrounding')  # レンダラーバックグラウンド処理抑制
-    options.add_argument('--disable-backgrounding-occluded-windows')  # 隠れたウィンドウのバックグラウンド処理抑制
-    options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])  # ログと自動化検出を除外
-    options.add_experimental_option('useAutomationExtension', False)  # 自動化拡張機能を無効化
-    
+    options.add_argument('--log-level=3')
+    options.add_argument('--disable-background-timer-throttling')
+    options.add_argument('--disable-renderer-backgrounding')
+    options.add_argument('--disable-backgrounding-occluded-windows')
+
     return options
 
 # 書き込み可能なディレクトリを取得する関数
@@ -334,7 +320,7 @@ class WorkerThread(QThread):
             driver = None
             try:
                 options = setup_chrome_options(headless)
-                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                driver = uc.Chrome(options=options, headless=headless)
                 driver.get("about:blank")
 
                 for index, row in chunk_df.iterrows():
@@ -377,7 +363,7 @@ class WorkerThread(QThread):
                         except:
                             pass
                         options = setup_chrome_options(headless)
-                        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                        driver = uc.Chrome(options=options, headless=headless)
                         driver.get("about:blank")
 
                     # 進捗更新
@@ -858,8 +844,8 @@ class WorkerThread(QThread):
                             pass
 
                         # Chromeブラウザの起動(再)
-                        options = setup_chrome_options(self.params.get("headless", True))  # ヘッドレスモード設定を渡す
-                        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                        options = setup_chrome_options(self.params.get("headless", True))
+                        driver = uc.Chrome(options=options, headless=self.params.get("headless", True))
                         driver.get("about:blank")
                 else:
                     self.update_signal.emit(f"最大リトライ回数に達しました。ユーザー {user_number} の処理をスキップします。")
@@ -907,7 +893,7 @@ class WorkerThread(QThread):
             driver = None
             try:
                 options = setup_chrome_options(headless)
-                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                driver = uc.Chrome(options=options, headless=headless)
 
                 for index, row in chunk_df.iterrows():
                     if not self.is_running:
@@ -1203,10 +1189,7 @@ class WorkerThread(QThread):
             try:
                 options = setup_chrome_options(headless)
                 options.add_argument("--disable-popup-blocking")
-                service = Service(ChromeDriverManager().install())
-                service.creation_flags = subprocess.CREATE_NO_WINDOW
-                service.log_path = os.devnull
-                driver = webdriver.Chrome(service=service, options=options)
+                driver = uc.Chrome(options=options, headless=headless)
 
                 for index, row in chunk_df.iterrows():
                     if not self.is_running:
@@ -1515,7 +1498,7 @@ class WorkerThread(QThread):
             driver = None
             try:
                 options = setup_chrome_options(headless)
-                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                driver = uc.Chrome(options=options, headless=headless)
 
                 for index, row in chunk_df.iterrows():
                     if not self.is_running:
@@ -1798,7 +1781,7 @@ class WorkerThread(QThread):
                 options.add_argument('--no-sandbox')
                 options.add_argument('--disable-dev-shm-usage')
                 options.add_argument('--disable-popup-blocking')
-                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                driver = uc.Chrome(options=options, headless=headless)
                 wait = WebDriverWait(driver, 10)
 
                 for index, row in chunk_df.iterrows():
