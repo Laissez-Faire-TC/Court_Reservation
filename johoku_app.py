@@ -21,12 +21,12 @@ import calendar
 import re
 from datetime import datetime
 from collections import defaultdict
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QPushButton, QLabel, QComboBox, QTabWidget,
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QPushButton, QLabel, QComboBox, QTabWidget, 
                              QLineEdit, QTextEdit, QFileDialog,
                              QGridLayout, QGroupBox, QHBoxLayout, QDateEdit,
                              QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
-                             QScrollArea, QSizePolicy, QCheckBox, QSpinBox)
+                             QScrollArea, QSizePolicy, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QDate, QStandardPaths
 from PyQt5.QtGui import QFont, QIcon
 
@@ -294,117 +294,114 @@ class WorkerThread(QThread):
     
     # 抽選申込の実行
     def run_lottery_application(self):
-        import threading
-        import concurrent.futures
-
         csv_file = self.params.get("csv_file", "Johoku1.csv")
         park_name = self.params.get("park_name", "城北中央公園")
+        gui_time_code = None  # 時間帯はCSVから取得
         apply_number_text = self.params.get("apply_number_text", "申込み1件目")
-        headless = self.params.get("headless", True)
-        parallel = self.params.get("parallel", 2)
-
+        headless = self.params.get("headless", True)  # ヘッドレスモード設定
+        
         self.update_signal.emit(f"CSVファイル {csv_file} から予約情報を読み込んでいます...")
         self.update_signal.emit(f"選択された公園: {park_name}")
-        self.update_signal.emit(f"並列数: {parallel}")
         self.update_signal.emit(f"ヘッドレスモード: {'有効' if headless else '無効'}")
-
+        
+        # 公園に応じた施設設定のマッピング
         park_facility_map = {
             "城北中央公園": "テニス（人工芝・照明有）",
             "城北中央公園(冬季)": "テニス（人工芝・照明有）",
             "木場公園": "テニス（人工芝）",
             "光が丘公園": "人工芝"
         }
+        
         facility_name = park_facility_map.get(park_name, "テニス（人工芝・照明有）")
         self.update_signal.emit(f"対象施設: {facility_name}")
-
+        
+        # CSVからデータを読み込み
         users_data = pd.read_csv(csv_file, dtype={
             'user_number': str,
             'password': str,
             'booking_date': str,
             'time_code': str
         })
+        
         total_users = len(users_data)
         self.update_signal.emit(f"{total_users}人のユーザー情報を読み込みました。")
+        
+        # Chromeブラウザの起動
+        self.update_signal.emit("Chromeブラウザを起動しています...")
+        options = setup_chrome_options(headless)  # ヘッドレスモード設定を渡す
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        driver.get("about:blank")
+        
+        try:
+            for index, row in users_data.iterrows():
+                if not self.is_running:
+                    self.update_signal.emit("処理が中断されました。")
+                    break
+                
+                user_number = row['user_number']
+                password = row['password']
+                booking_date = row['booking_date']
+                # GUIからtime_codeが指定されていればそれを使用、なければCSVの値を使用
+                time_code = gui_time_code if gui_time_code else row['time_code']
+                
+                # booking_date を正しく分解（例: 2025-05-02 -> 年=2025, 月=5, 日=2）
+                date_parts = booking_date.split('-')
+                year = int(date_parts[0])
+                month = int(date_parts[1])
+                booking_day = int(date_parts[2])
+                
+                # 月の最終日を取得
+                month_end = calendar.monthrange(year, month)[1]
 
-        # 進捗管理（スレッドセーフ）
-        completed_count = [0]
-        progress_lock = threading.Lock()
+                progress = int((index / total_users) * 100)
+                self.progress_signal.emit(progress)
+                
+                self.update_signal.emit(f"\nユーザー {user_number} の予約処理を開始します... ({index+1}/{total_users})")
+                self.update_signal.emit(f"予約日: {year}年{month}月{booking_day}日, 月末: {month_end}日")
+                self.update_signal.emit(f"申込み種類: {apply_number_text}")
 
-        def process_chunk(chunk_df, chunk_id):
-            driver = None
-            try:
-                options = setup_chrome_options(headless)
-                driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-                driver.get("about:blank")
+                # 新しいタブを開く
+                driver.execute_script("window.open('');")
+                new_tab = driver.window_handles[-1]
+                driver.switch_to.window(new_tab)
 
-                for index, row in chunk_df.iterrows():
-                    if not self.is_running:
-                        self.update_signal.emit(f"[スレッド{chunk_id}] 処理が中断されました。")
-                        break
+                # 選択された申込み種類を使用
+                success = self.handle_booking_process(driver, user_number, password, booking_day, time_code, apply_number_text, month_end, park_name, facility_name)
+                
+                if success:
+                    self.update_signal.emit(f"ユーザー {user_number} の全処理が完了しました。")
+                else:
+                    self.update_signal.emit(f"ユーザー {user_number} の処理は失敗しました。次のユーザーに進みます。")
 
-                    user_number = row['user_number']
-                    password = row['password']
-                    booking_date = row['booking_date']
-                    time_code = row['time_code']
-
-                    date_parts = booking_date.split('-')
-                    year = int(date_parts[0])
-                    month = int(date_parts[1])
-                    booking_day = int(date_parts[2])
-                    month_end = calendar.monthrange(year, month)[1]
-
-                    self.update_signal.emit(f"\n[スレッド{chunk_id}] ユーザー {user_number} の処理開始")
-                    self.update_signal.emit(f"[スレッド{chunk_id}] 予約日: {year}年{month}月{booking_day}日")
-
-                    # 新しいタブを開く
-                    driver.execute_script("window.open('');")
-                    new_tab = driver.window_handles[-1]
-                    driver.switch_to.window(new_tab)
-
-                    success = self.handle_booking_process(driver, user_number, password, booking_day, time_code, apply_number_text, month_end, park_name, facility_name)
-
-                    if success:
-                        self.update_signal.emit(f"[スレッド{chunk_id}] ユーザー {user_number} 完了")
-                    else:
-                        self.update_signal.emit(f"[スレッド{chunk_id}] ユーザー {user_number} 失敗")
-
-                    # タブの状態確認・修復
-                    try:
-                        driver.current_window_handle
-                    except:
-                        try:
-                            driver.quit()
-                        except:
-                            pass
-                        options = setup_chrome_options(headless)
-                        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-                        driver.get("about:blank")
-
-                    # 進捗更新
-                    with progress_lock:
-                        completed_count[0] += 1
-                        progress = int((completed_count[0] / total_users) * 100)
-                        self.progress_signal.emit(progress)
-
-                    time_module.sleep(random.uniform(1.0, 3.0))
-
-            except Exception as e:
-                self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {str(e)}")
-            finally:
+                # エラーが発生していた場合に備えて、タブの状態を確認・修復
                 try:
-                    driver.quit()
+                    current_handle = driver.current_window_handle
                 except:
-                    pass
+                    # ブラウザを再起動
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+                    # Chromeブラウザの起動(再)
+                    options = setup_chrome_options(headless)  # ヘッドレスモード設定を渡す
+                    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                    driver.get("about:blank")
 
-        # ユーザーリストをparallel分割
-        chunks = [users_data.iloc[i::parallel] for i in range(parallel)]
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
-            futures = [executor.submit(process_chunk, chunk, i+1) for i, chunk in enumerate(chunks)]
-            concurrent.futures.wait(futures)
-
-        self.progress_signal.emit(100)
-        self.update_signal.emit("全ての予約処理が完了しました。")
+                # ユーザー間の待機時間
+                time_module.sleep(random.uniform(1.0, 3.0))
+            
+            # 最終的な進捗状況を100%に設定
+            self.progress_signal.emit(100)
+            self.update_signal.emit("全ての予約処理が完了しました。")
+            
+        except Exception as e:
+            self.update_signal.emit(f"実行中にエラーが発生しました: {str(e)}")
+            raise
+        finally:
+            try:
+                driver.quit()
+            except:
+                pass
 
     # 既存の機能を呼び出す実装部分（元のスクリプトから必要な関数を実装）
     def human_like_mouse_move(self, driver, element):
@@ -2203,17 +2200,6 @@ class JohokuApp(QMainWindow):
         type_layout.addWidget(self.apply_type)
         layout.addLayout(type_layout)
         
-        # 並列数選択
-        parallel_layout = QHBoxLayout()
-        parallel_layout.addWidget(QLabel("並列数:"))
-        self.parallel_spinbox = QSpinBox()
-        self.parallel_spinbox.setMinimum(1)
-        self.parallel_spinbox.setMaximum(5)
-        self.parallel_spinbox.setValue(2)
-        parallel_layout.addWidget(self.parallel_spinbox)
-        parallel_layout.addStretch()
-        layout.addLayout(parallel_layout)
-
         # ヘッドレスモード選択（追加）
         self.lottery_headless_checkbox = QCheckBox("ヘッドレスモード（ブラウザ非表示）")
         self.lottery_headless_checkbox.setChecked(True)  # デフォルトはオン
@@ -2678,8 +2664,7 @@ class JohokuApp(QMainWindow):
             "csv_file": csv_file,
             "park_name": park_name,
             "apply_number_text": apply_number_text,
-            "headless": headless,
-            "parallel": self.parallel_spinbox.value()
+            "headless": headless
         }
         
         # ワーカースレッドを作成・起動
