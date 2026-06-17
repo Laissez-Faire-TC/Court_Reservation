@@ -1,11 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 
 block_cipher = None
+
+# パッチ済み chromedriver.exe を同梱する。
+# 同じフォルダに chromedriver.exe を置いてからビルドすること。
+# （uc がネットDL・パッチをせずに済み、配布先での起動失敗を防ぐ）
+_driver = 'chromedriver.exe'
+_driver_binaries = [(_driver, '.')] if os.path.exists(_driver) else []
+if not _driver_binaries:
+    print('=' * 60)
+    print('警告: chromedriver.exe が見つかりません。')
+    print('同梱なしでビルドします（配布先で uc がDL・パッチを試みます）。')
+    print('=' * 60)
 
 a = Analysis(
     ['johoku_app.py'],
     pathex=[],
-    binaries=[],
+    binaries=_driver_binaries,
     datas=[],
     hiddenimports=['PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtWidgets', 'selenium.webdriver', 'pandas', 'webdriver_manager', 'undetected_chromedriver', 'undetected_chromedriver.patcher', 'undetected_chromedriver.reactor', 'undetected_chromedriver.cdp', 'websockets'],
     hookspath=[],

@@ -132,6 +132,39 @@ def setup_chrome_options(headless=True):
 _driver_creation_lock = threading.Lock()
 
 
+def find_bundled_chromedriver():
+    """アプリに同梱した chromedriver のパスを返す（無ければ None）。
+
+    配布版(PyInstaller)では、ネットワークDLやパッチ時の署名破壊を避けるため、
+    パッチ済みの chromedriver を同梱し、それを uc に渡して使う。
+    探索先:
+      - PyInstaller onefile 展開先 (sys._MEIPASS)
+      - 実行ファイルと同じフォルダ / その _internal (onedir 構成)
+      - ソース実行時はスクリプトと同じフォルダ
+    """
+    candidates = []
+    exe_name = "chromedriver.exe" if sys.platform.startswith("win") else "chromedriver"
+
+    # PyInstaller の展開先
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, exe_name))
+
+    # 実行ファイル / スクリプトのあるディレクトリ
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(base_dir, exe_name))
+    candidates.append(os.path.join(base_dir, "_internal", exe_name))
+    candidates.append(os.path.join(base_dir, "driver", exe_name))
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def create_driver(headless=True, extra_args=None, max_retries=3, log_callback=None):
     """undetected-chromedriver を安全に生成する共通関数。
 
@@ -147,6 +180,11 @@ def create_driver(headless=True, extra_args=None, max_retries=3, log_callback=No
             except Exception:
                 pass
 
+    # 同梱ドライバがあれば使う（DL不要・パッチ済みなら uc は再パッチしない＝署名も維持）
+    bundled = find_bundled_chromedriver()
+    if bundled:
+        _log(f"同梱のchromedriverを使用します: {bundled}")
+
     last_error = None
     for attempt in range(max_retries):
         try:
@@ -159,9 +197,14 @@ def create_driver(headless=True, extra_args=None, max_retries=3, log_callback=No
                 options.add_argument('--headless=old')
                 options.add_argument('--disable-gpu')
 
+            uc_kwargs = {"options": options, "use_subprocess": True}
+            if bundled:
+                # パッチ済みドライバを同梱している場合、uc はそれを使い DL もパッチもしない
+                uc_kwargs["driver_executable_path"] = bundled
+
             # 生成だけをロックで保護（起動後の操作は並列のまま）
             with _driver_creation_lock:
-                driver = uc.Chrome(options=options, use_subprocess=True)
+                driver = uc.Chrome(**uc_kwargs)
             return driver
         except Exception as e:
             last_error = e

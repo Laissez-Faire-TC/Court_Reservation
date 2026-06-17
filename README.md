@@ -52,14 +52,32 @@ python johoku_app.py
 ## ビルド方法
 
 ### Windows (.exe)
-```bash
-pyinstaller --onefile --windowed --icon=app_icon.ico johoku_app.py
-```
+
+reCAPTCHA対策に undetected-chromedriver を使用しているため、**ビルド前に
+パッチ済み chromedriver を同梱する準備が必要**です（配布先での
+ドライバDL失敗・パッチ失敗を防ぐため）。
+
+1. ビルドするPCに Chrome をインストールしておく
+2. パッチ済みドライバを用意する（Chrome更新時も再実行）:
+   ```bash
+   python prepare_driver.py
+   ```
+   → このフォルダに `chromedriver.exe` が作成されます
+3. spec を使ってビルド:
+   ```bash
+   pyinstaller build_windows.spec
+   ```
+   `build_windows.spec` が `chromedriver.exe` を自動で同梱します。
+
+> `chromedriver.exe` が無い状態でもビルドはできますが、その場合は
+> 配布先で uc がドライバを自動DL・パッチします（ネットワーク必須・失敗の可能性あり）。
 
 ### macOS (.app)
 ```bash
 python setup.py py2app
 ```
+※ macOS では undetected-chromedriver がパッチ時に署名を破壊し、
+Gatekeeper に起動を阻止されることがあります（本番配布は Windows 想定）。
 
 ## 使用方法
 
