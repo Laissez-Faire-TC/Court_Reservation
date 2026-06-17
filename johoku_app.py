@@ -19,6 +19,7 @@ import time as time_module
 import random
 import calendar
 import re
+import threading
 from datetime import datetime
 from collections import defaultdict
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -123,6 +124,65 @@ def setup_chrome_options(headless=True):
     options.add_argument('--disable-backgrounding-occluded-windows')
 
     return options
+
+# undetected-chromedriver の生成を直列化するためのグローバルロック。
+# uc は内部でドライバのパッチ・生成を行うため、複数スレッドから同時に
+# uc.Chrome() を呼ぶとパッチ処理が競合して起動失敗・クラッシュしやすい。
+# 生成（＝最も競合しやすい瞬間）だけをロックで保護し、起動後の操作は並列で動かす。
+_driver_creation_lock = threading.Lock()
+
+
+def create_driver(headless=True, extra_args=None, max_retries=3, log_callback=None):
+    """undetected-chromedriver を安全に生成する共通関数。
+
+    - 生成をグローバルロックで直列化し、マルチスレッド時の競合を防ぐ
+    - 起動失敗時はリトライする
+    - headless はオプション側で制御し、uc 側の headless 引数は使わない
+      （uc の新ヘッドレスは自動化検出されやすく reCAPTCHA 回避の目的と矛盾するため）
+    """
+    def _log(msg):
+        if log_callback:
+            try:
+                log_callback(msg)
+            except Exception:
+                pass
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            options = setup_chrome_options(headless)
+            if extra_args:
+                for arg in extra_args:
+                    options.add_argument(arg)
+            # 旧来のヘッドレス引数を使う（uc の新ヘッドレスより検出されにくい）
+            if headless:
+                options.add_argument('--headless=old')
+                options.add_argument('--disable-gpu')
+
+            # 生成だけをロックで保護（起動後の操作は並列のまま）
+            with _driver_creation_lock:
+                driver = uc.Chrome(options=options, use_subprocess=True)
+            return driver
+        except Exception as e:
+            last_error = e
+            _log(f"ブラウザ起動に失敗しました（試行 {attempt + 1}/{max_retries}）: {str(e)}")
+            time_module.sleep(random.uniform(2.0, 4.0))
+
+    raise RuntimeError(f"ブラウザの起動に {max_retries} 回失敗しました: {str(last_error)}")
+
+
+def quit_driver(driver):
+    """ドライバを安全に終了する。
+
+    uc は終了時（__del__ 含む）に WinError 6 等の例外を投げることがあるため、
+    例外を握りつぶして確実にクリーンアップする。
+    """
+    if driver is None:
+        return
+    try:
+        driver.quit()
+    except Exception:
+        pass
 
 # 書き込み可能なディレクトリを取得する関数
 def get_writable_dir():
@@ -319,8 +379,7 @@ class WorkerThread(QThread):
         def process_chunk(chunk_df, chunk_id):
             driver = None
             try:
-                options = setup_chrome_options(headless)
-                driver = uc.Chrome(options=options, headless=headless)
+                driver = create_driver(headless, log_callback=lambda m: self.update_signal.emit(f"[スレッド{chunk_id}] {m}"))
                 driver.get("about:blank")
 
                 for index, row in chunk_df.iterrows():
@@ -358,12 +417,8 @@ class WorkerThread(QThread):
                     try:
                         driver.current_window_handle
                     except:
-                        try:
-                            driver.quit()
-                        except:
-                            pass
-                        options = setup_chrome_options(headless)
-                        driver = uc.Chrome(options=options, headless=headless)
+                        quit_driver(driver)
+                        driver = create_driver(headless, log_callback=lambda m: self.update_signal.emit(f"[スレッド{chunk_id}] {m}"))
                         driver.get("about:blank")
 
                     # 進捗更新
@@ -377,10 +432,7 @@ class WorkerThread(QThread):
             except Exception as e:
                 self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {str(e)}")
             finally:
-                try:
-                    driver.quit()
-                except:
-                    pass
+                quit_driver(driver)
 
         # ユーザーリストをparallel分割
         chunks = [users_data.iloc[i::parallel] for i in range(parallel)]
@@ -838,14 +890,10 @@ class WorkerThread(QThread):
                         time_module.sleep(random.uniform(20.0, 30.0))
                     except Exception as tab_error:
                         self.update_signal.emit(f"タブの切り替え中にエラーが発生: {str(tab_error)}")
-                        try:
-                            driver.quit()
-                        except:
-                            pass
+                        quit_driver(driver)
 
                         # Chromeブラウザの起動(再)
-                        options = setup_chrome_options(self.params.get("headless", True))
-                        driver = uc.Chrome(options=options, headless=self.params.get("headless", True))
+                        driver = create_driver(self.params.get("headless", True), log_callback=self.update_signal.emit)
                         driver.get("about:blank")
                 else:
                     self.update_signal.emit(f"最大リトライ回数に達しました。ユーザー {user_number} の処理をスキップします。")
@@ -892,8 +940,8 @@ class WorkerThread(QThread):
         def process_chunk(chunk_df, chunk_id):
             driver = None
             try:
-                options = setup_chrome_options(headless)
-                driver = uc.Chrome(options=options, headless=headless)
+                _extra_args = []
+                driver = create_driver(headless, extra_args=_extra_args, log_callback=lambda m: self.update_signal.emit(f"[スレッド{chunk_id}] {m}"))
 
                 for index, row in chunk_df.iterrows():
                     if not self.is_running:
@@ -1094,10 +1142,7 @@ class WorkerThread(QThread):
             except Exception as e:
                 self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {str(e)}")
             finally:
-                try:
-                    driver.quit()
-                except:
-                    pass
+                quit_driver(driver)
 
         chunks = [users_data.iloc[i::parallel] for i in range(parallel)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
@@ -1187,9 +1232,9 @@ class WorkerThread(QThread):
         def process_chunk(chunk_df, chunk_id):
             driver = None
             try:
-                options = setup_chrome_options(headless)
-                options.add_argument("--disable-popup-blocking")
-                driver = uc.Chrome(options=options, headless=headless)
+                # --disable-popup-blocking は setup_chrome_options 内で設定済み
+                _extra_args = []
+                driver = create_driver(headless, extra_args=_extra_args, log_callback=lambda m: self.update_signal.emit(f"[スレッド{chunk_id}] {m}"))
 
                 for index, row in chunk_df.iterrows():
                     if not self.is_running:
@@ -1434,10 +1479,7 @@ class WorkerThread(QThread):
             except Exception as e:
                 self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {str(e)}")
             finally:
-                try:
-                    driver.quit()
-                except:
-                    pass
+                quit_driver(driver)
 
         chunks = [users_data.iloc[i::parallel] for i in range(parallel)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
@@ -1497,8 +1539,8 @@ class WorkerThread(QThread):
         def process_chunk(chunk_df, chunk_id):
             driver = None
             try:
-                options = setup_chrome_options(headless)
-                driver = uc.Chrome(options=options, headless=headless)
+                _extra_args = []
+                driver = create_driver(headless, extra_args=_extra_args, log_callback=lambda m: self.update_signal.emit(f"[スレッド{chunk_id}] {m}"))
 
                 for index, row in chunk_df.iterrows():
                     if not self.is_running:
@@ -1689,10 +1731,7 @@ class WorkerThread(QThread):
             except Exception as e:
                 self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {str(e)}")
             finally:
-                try:
-                    driver.quit()
-                except:
-                    pass
+                quit_driver(driver)
 
         chunks = [users_data.iloc[i::parallel] for i in range(parallel)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
@@ -1777,11 +1816,8 @@ class WorkerThread(QThread):
         def process_chunk(chunk_df, chunk_id):
             driver = None
             try:
-                options = setup_chrome_options(headless)
-                options.add_argument('--no-sandbox')
-                options.add_argument('--disable-dev-shm-usage')
-                options.add_argument('--disable-popup-blocking')
-                driver = uc.Chrome(options=options, headless=headless)
+                _extra_args = ['--no-sandbox', '--disable-dev-shm-usage']
+                driver = create_driver(headless, extra_args=_extra_args, log_callback=lambda m: self.update_signal.emit(f"[スレッド{chunk_id}] {m}"))
                 wait = WebDriverWait(driver, 10)
 
                 for index, row in chunk_df.iterrows():
@@ -1955,10 +1991,7 @@ class WorkerThread(QThread):
             except Exception as e:
                 self.update_signal.emit(f"[スレッド{chunk_id}] エラー: {str(e)}")
             finally:
-                try:
-                    driver.quit()
-                except:
-                    pass
+                quit_driver(driver)
 
         chunks = [users_data.iloc[i::parallel] for i in range(parallel)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
