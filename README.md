@@ -72,6 +72,13 @@ reCAPTCHA対策に undetected-chromedriver を使用しているため、**ビ�
 > `chromedriver.exe` が無い状態でもビルドはできますが、その場合は
 > 配布先で uc がドライバを自動DL・パッチします（ネットワーク必須・失敗の可能性あり）。
 
+> **バージョン不一致への自動対応**: 配布先の Chrome が同梱ドライバと
+> バージョン違いで起動できない場合（`session not created` /
+> `cannot connect to chrome` 等）、アプリは自動的にその環境の Chrome に
+> 合うドライバを取得して再起動します（ネットワーク接続が必要）。
+> 確実に動かすには、Chrome 更新のたびに `prepare_driver.py` でドライバを
+> 作り直して再ビルドするのが最善です。
+
 ### macOS (.app)
 ```bash
 python setup.py py2app

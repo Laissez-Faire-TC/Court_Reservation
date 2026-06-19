@@ -165,11 +165,52 @@ def find_bundled_chromedriver():
     return None
 
 
+def detect_chrome_major_version():
+    """インストール済み Chrome のメジャーバージョン(int)を返す。取得失敗時は None。"""
+    import subprocess
+    import re
+
+    candidates = []
+    if sys.platform.startswith("win"):
+        try:
+            import winreg
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    key = winreg.OpenKey(hive, r"SOFTWARE\Google\Chrome\BLBeacon")
+                    ver, _ = winreg.QueryValueEx(key, "version")
+                    if ver:
+                        return int(ver.split(".")[0])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+    elif sys.platform == "darwin":
+        candidates = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    else:
+        candidates = ["google-chrome", "google-chrome-stable", "chromium-browser", "chromium"]
+
+    for path in candidates:
+        try:
+            out = subprocess.run([path, "--version"], capture_output=True, text=True)
+            m = re.search(r"(\d+)\.\d+\.\d+\.\d+", out.stdout)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            continue
+    return None
+
+
 def create_driver(headless=True, extra_args=None, max_retries=3, log_callback=None):
     """undetected-chromedriver を安全に生成する共通関数。
 
     - 生成をグローバルロックで直列化し、マルチスレッド時の競合を防ぐ
-    - 起動失敗時はリトライする
+    - まず同梱ドライバで起動を試みる（DL不要・パッチ済みなら再パッチしない）
+    - 同梱ドライバがChromeとバージョン不一致で失敗した場合は、
+      その環境のChromeに合うドライバを uc に取得させてフォールバックする
     - headless はオプション側で制御し、uc 側の headless 引数は使わない
       （uc の新ヘッドレスは自動化検出されやすく reCAPTCHA 回避の目的と矛盾するため）
     """
@@ -180,13 +221,18 @@ def create_driver(headless=True, extra_args=None, max_retries=3, log_callback=No
             except Exception:
                 pass
 
-    # 同梱ドライバがあれば使う（DL不要・パッチ済みなら uc は再パッチしない＝署名も維持）
+    # 同梱ドライバがあれば最初はそれを使う（DL不要・パッチ済みなら再パッチしない）
     bundled = find_bundled_chromedriver()
-    if bundled:
+    use_bundled = bundled is not None
+    if use_bundled:
         _log(f"同梱のchromedriverを使用します: {bundled}")
 
+    chrome_major = detect_chrome_major_version()
+    bundled_fallback_done = False  # 同梱ドライバ失敗→DL版への切替を一度だけ行う
+
     last_error = None
-    for attempt in range(max_retries):
+    attempt = 0
+    while attempt < max_retries:
         try:
             options = setup_chrome_options(headless)
             if extra_args:
@@ -198,9 +244,12 @@ def create_driver(headless=True, extra_args=None, max_retries=3, log_callback=No
                 options.add_argument('--disable-gpu')
 
             uc_kwargs = {"options": options, "use_subprocess": True}
-            if bundled:
+            if use_bundled:
                 # パッチ済みドライバを同梱している場合、uc はそれを使い DL もパッチもしない
                 uc_kwargs["driver_executable_path"] = bundled
+            elif chrome_major:
+                # フォールバック時: その環境のChromeに合うドライバを uc に取得させる
+                uc_kwargs["version_main"] = chrome_major
 
             # 生成だけをロックで保護（起動後の操作は並列のまま）
             with _driver_creation_lock:
@@ -208,8 +257,21 @@ def create_driver(headless=True, extra_args=None, max_retries=3, log_callback=No
             return driver
         except Exception as e:
             last_error = e
-            _log(f"ブラウザ起動に失敗しました（試行 {attempt + 1}/{max_retries}）: {str(e)}")
-            time_module.sleep(random.uniform(2.0, 4.0))
+            err_text = str(e)
+            _log(f"ブラウザ起動に失敗しました（試行 {attempt + 1}/{max_retries}）: {err_text}")
+
+            # 同梱ドライバで失敗した場合、まずは同梱を諦めて
+            # その環境のChromeに合うドライバを取得する方式に一度だけ切り替える
+            # （バージョン不一致 cannot connect / session not created 等を含む）
+            if use_bundled and not bundled_fallback_done:
+                use_bundled = False
+                bundled_fallback_done = True
+                _log("同梱ドライバで起動できませんでした。環境に合うドライバを取得して再試行します。")
+                continue  # 回数を消費せず即再試行
+
+            attempt += 1
+            if attempt < max_retries:
+                time_module.sleep(random.uniform(2.0, 4.0))
 
     raise RuntimeError(f"ブラウザの起動に {max_retries} 回失敗しました: {str(last_error)}")
 
