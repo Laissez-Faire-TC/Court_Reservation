@@ -463,7 +463,8 @@ class WorkerThread(QThread):
             "城北中央公園": "テニス（人工芝・照明有）",
             "城北中央公園(冬季)": "テニス（人工芝・照明有）",
             "木場公園": "テニス（人工芝）",
-            "光が丘公園": "人工芝"
+            "光が丘公園": "人工芝",
+            "舎人公園": "テニス（人工芝）"
         }
         facility_name = park_facility_map.get(park_name, "テニス（人工芝・照明有）")
         self.update_signal.emit(f"対象施設: {facility_name}")
@@ -2274,6 +2275,7 @@ class JohokuApp(QMainWindow):
         self.park_select.addItem("城北中央公園(冬季)")
         self.park_select.addItem("木場公園")
         self.park_select.addItem("光が丘公園")
+        self.park_select.addItem("舎人公園")
         self.park_select.currentTextChanged.connect(self.on_park_selection_changed)
         park_layout.addWidget(self.park_select)
         park_layout.addStretch()
