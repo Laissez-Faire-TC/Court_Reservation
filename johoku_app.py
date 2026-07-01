@@ -2743,17 +2743,17 @@ class JohokuApp(QMainWindow):
     
     # 公園選択変更時のハンドラ
     def on_park_selection_changed(self, park_name):
-        self.lottery_time_select.clear()
+        self.time_code_select.clear()
         if park_name == "城北中央公園(冬季)":
             # 冬季は3コマ
-            self.lottery_time_select.addItems([
+            self.time_code_select.addItems([
                 "9:00~11:00",
-                "11:00~13:00", 
+                "11:00~13:00",
                 "13:00~16:00"
             ])
         else:
             # その他は通常の6コマ
-            self.lottery_time_select.addItems([
+            self.time_code_select.addItems([
                 "9:00~11:00",
                 "11:00~13:00", 
                 "13:00~15:00",
